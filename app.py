@@ -516,6 +516,10 @@ def main() -> None:
     with tab_cmp:
         st.markdown("### Dataset Comparison (Overlap vs Unique Interactors)")
         ds_options = dataset_keys_all
+        if len(ds_options) < 2:
+            st.info("Comparison needs at least two datasets in `/Data`.")
+            return
+
         idx_a = ds_options.index(selected_dataset) if selected_dataset in ds_options else 0
         idx_b = 1 if len(ds_options) > 1 else 0
 
@@ -525,49 +529,62 @@ def main() -> None:
         with colB:
             dataset_b = st.selectbox("Dataset B", options=ds_options, index=idx_b if idx_b != idx_a else 0)
 
-        df_a = aggregated_by_file[dataset_a]
-        df_b = aggregated_by_file[dataset_b]
+        try:
+            if dataset_a not in aggregated_by_file or dataset_b not in aggregated_by_file:
+                st.error("Comparison failed: one or both selected datasets could not be loaded.")
+                return
 
-        merged = _comparison_table(df_a, df_b)
-        overlap = int((merged["category"] == "Both").sum())
-        only_a = int((merged["category"] == "Only A").sum())
-        only_b = int((merged["category"] == "Only B").sum())
+            df_a = aggregated_by_file[dataset_a]
+            df_b = aggregated_by_file[dataset_b]
+            merged = _comparison_table(df_a, df_b)
+            if merged.empty or "category" not in merged.columns:
+                st.error("Comparison failed: overlap categories were not generated.")
+                return
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Overlapping Interactors", f"{overlap}")
-        m2.metric("Unique to A", f"{only_a}")
-        m3.metric("Unique to B", f"{only_b}")
+            overlap = int((merged["category"] == "Both").sum())
+            only_a = int((merged["category"] == "Only A").sum())
+            only_b = int((merged["category"] == "Only B").sum())
 
-        show_cols = [
-            "Gene Symbol",
-            "category",
-            "Spectral Count_A",
-            "Spectral Count_B",
-            "Unique Peptides_A",
-            "Unique Peptides_B",
-            "Confidence Score_A",
-            "Confidence Score_B",
-            "is_baf_core",
-        ]
-        df_cmp = merged[show_cols].copy()
-        df_cmp["is_baf_core"] = df_cmp["is_baf_core"].fillna(False)
-        df_cmp = df_cmp.sort_values(
-            by=["is_baf_core", "category", "Spectral Count_A", "Spectral Count_B"],
-            ascending=[False, True, False, False],
-            kind="mergesort",
-        )
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Overlapping Interactors", f"{overlap}")
+            m2.metric("Unique to A", f"{only_a}")
+            m3.metric("Unique to B", f"{only_b}")
 
-        styler_cmp = _styled_gene_table(df_cmp.rename(columns={"category": "Overlap Category"}))
-        st.dataframe(styler_cmp, use_container_width=True, height=560)
+            show_cols = [
+                "Gene Symbol",
+                "category",
+                "Spectral Count_A",
+                "Spectral Count_B",
+                "Unique Peptides_A",
+                "Unique Peptides_B",
+                "Confidence Score_A",
+                "Confidence Score_B",
+                "is_baf_core",
+            ]
+            df_cmp = merged[show_cols].copy()
+            df_cmp = df_cmp.rename(columns={"category": "Overlap Category"})
+            df_cmp["is_baf_core"] = df_cmp["is_baf_core"].fillna(False)
+            df_cmp = df_cmp.sort_values(
+                by=["is_baf_core", "Overlap Category", "Spectral Count_A", "Spectral Count_B"],
+                ascending=[False, True, False, False],
+                kind="mergesort",
+            )
 
-        # Optional: show a small plotly summary for overlaps (BAF cores emphasized).
-        st.markdown("### BAF Core Emphasis")
-        core_only = df_cmp[df_cmp["is_baf_core"] == True]
-        if not core_only.empty:
-            core_counts = core_only["Overlap Category"].value_counts().to_dict()
-            st.write(core_counts)
-        else:
-            st.caption("No BAF-core genes found in either dataset.")
+            styler_cmp = _styled_gene_table(df_cmp)
+            st.dataframe(styler_cmp, use_container_width=True, height=560)
+
+            # Optional: show a small summary for BAF-core overlap categories.
+            st.markdown("### BAF Core Emphasis")
+            core_only = df_cmp[df_cmp["is_baf_core"] == True]
+            if not core_only.empty and "Overlap Category" in core_only.columns:
+                core_counts = core_only["Overlap Category"].value_counts().to_dict()
+                st.write(core_counts)
+            elif not core_only.empty:
+                st.caption("BAF-core genes found, but overlap category values are unavailable.")
+            else:
+                st.caption("No BAF-core genes found in either dataset.")
+        except Exception as e:
+            st.error(f"Comparison failed: unable to compute overlap for the selected datasets. Details: {e}")
 
 
 if __name__ == "__main__":
