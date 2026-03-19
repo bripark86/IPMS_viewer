@@ -1,0 +1,10 @@
+# Ignore the data folder entirely
+Data/
+/Users/sp1665/Downloads/IPMS/Janet_Liu
+
+# Ignore Python cache and environment
+__pycache__/
+*.pyc
+.env
+.DS_Store
+.streamlit/

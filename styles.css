@@ -1,0 +1,29 @@
+/* Dark-mode biotech dashboard styling */
+body {
+  background-color: #0E1117;
+  color: #E6EDF3;
+}
+
+.sidebar .sidebar-content {
+  background-color: #0B0E14;
+}
+
+.stMetric {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+div[data-testid="stMetricLabel"] {
+  color: rgba(230, 237, 243, 0.8);
+  font-weight: 600;
+}
+
+/* Improve headings spacing */
+.stMarkdown h1,
+.stMarkdown h2,
+.stMarkdown h3 {
+  letter-spacing: -0.01em;
+}
+
