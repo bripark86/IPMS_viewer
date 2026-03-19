@@ -2,8 +2,27 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 
-from app import LOCAL_DATA_DIR, DATA_SOURCE_DIR_DEFAULT, sync_csvs_to_local_data
+LOCAL_DATA_DIR = os.path.join(os.path.dirname(__file__), "Data")
+DATA_SOURCE_DIR_DEFAULT = "/Users/sp1665/Downloads/IPMS/Janet_Liu"
+
+
+def sync_csvs_to_local_data(source_dir: str, dest_dir: str, overwrite: bool = False) -> dict[str, int]:
+    os.makedirs(dest_dir, exist_ok=True)
+    copied = 0
+    skipped = 0
+    with os.scandir(source_dir) as src_it:
+        for entry in src_it:
+            if not entry.is_file() or not entry.name.lower().endswith(".csv"):
+                continue
+            dst_path = os.path.join(dest_dir, entry.name)
+            if (not overwrite) and os.path.exists(dst_path):
+                skipped += 1
+                continue
+            shutil.copy2(entry.path, dst_path)
+            copied += 1
+    return {"copied": copied, "skipped": skipped}
 
 
 def main() -> None:

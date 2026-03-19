@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 from typing import Any
 
 import numpy as np
@@ -20,13 +19,16 @@ DATA_SOURCE_DIR_DEFAULT = "/Users/sp1665/Downloads/IPMS/Janet_Liu"
 PROJECT_ROOT = os.path.dirname(__file__)
 LOCAL_DATA_DIR = os.path.join(PROJECT_ROOT, "Data")
 DATA_EMPTY_MESSAGE = "No datasets found in /Data. Please add IP-MS CSVs to begin analysis."
+CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
 
 
 def _apply_global_css() -> None:
     styles_path = os.path.join(PROJECT_ROOT, "styles.css")
     if os.path.exists(styles_path):
         with open(styles_path, "r", encoding="utf-8", errors="replace") as f:
-            st.markdown(f.read(), unsafe_allow_html=True)
+            css = f.read()
+        # Always inject CSS inside a <style> tag so it renders correctly.
+        st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
         return
 
     # Fallback CSS if styles.css isn't present.
@@ -59,38 +61,35 @@ def _count_csv_files(data_dir: str) -> int:
         return 0
 
 
-def sync_csvs_to_local_data(
-    source_dir: str,
+def save_uploaded_csvs_to_local_data(
+    uploaded_files: list[Any],
     dest_dir: str,
     *,
     overwrite: bool = False,
 ) -> dict[str, int]:
     """
-    Copy CSVs from `source_dir` to `dest_dir`.
-    Returns simple counts: {'copied': X, 'skipped': Y}.
+    Save uploaded CSVs to local Data directory.
+    Returns counts: {'saved': X, 'skipped': Y}.
     """
     os.makedirs(dest_dir, exist_ok=True)
-    copied = 0
+    saved = 0
     skipped = 0
 
-    with os.scandir(source_dir) as src_it:
-        for entry in src_it:
-            if not entry.is_file():
-                continue
-            if not entry.name.lower().endswith(".csv"):
-                continue
+    for uploaded in uploaded_files:
+        if uploaded is None:
+            continue
+        name = getattr(uploaded, "name", "")
+        if not str(name).lower().endswith(".csv"):
+            continue
+        dst_path = os.path.join(dest_dir, name)
+        if (not overwrite) and os.path.exists(dst_path):
+            skipped += 1
+            continue
+        with open(dst_path, "wb") as f:
+            f.write(uploaded.getbuffer())
+        saved += 1
 
-            src_path = entry.path
-            dst_path = os.path.join(dest_dir, entry.name)
-
-            if (not overwrite) and os.path.exists(dst_path):
-                skipped += 1
-                continue
-
-            shutil.copy2(src_path, dst_path)
-            copied += 1
-
-    return {"copied": copied, "skipped": skipped}
+    return {"saved": saved, "skipped": skipped}
 
 
 def _pretty_dataset_label(filename: str, meta: dict[str, Any]) -> str:
@@ -98,7 +97,7 @@ def _pretty_dataset_label(filename: str, meta: dict[str, Any]) -> str:
     bait = meta.get("bait") or "NA"
     rep = meta.get("replicate")
     rep_s = str(rep) if rep is not None else "NA"
-    return f"{filename} | {cl} | {bait} | Rep {rep_s}"
+    return f"Bait: {bait} | Cell: {cl} | Rep {rep_s} | {filename}"
 
 
 def _pick_top_interactor(df: pd.DataFrame) -> str | None:
@@ -347,6 +346,7 @@ def _dataset_appearance_for_subunit(df_gene: pd.DataFrame, subunit: str) -> bool
 
 def main() -> None:
     st.set_page_config(page_title="BAF-Complex IP-MS Analytics Portal", layout="wide")
+    # Inject CSS at app startup so it applies globally.
     _apply_global_css()
 
     st.title("BAF-Complex IP-MS Analytics Portal")
@@ -363,25 +363,29 @@ def main() -> None:
         st.markdown("### Data Directory & File Management")
         st.caption(f"Local data: `{LOCAL_DATA_DIR}`")
 
-        overwrite = st.checkbox("Overwrite existing files on sync", value=False)
-        if st.button("Sync CSVs from source"):
-            if not os.path.exists(DATA_SOURCE_DIR_DEFAULT):
-                st.error(f"Source directory not found: `{DATA_SOURCE_DIR_DEFAULT}`")
-            else:
-                try:
-                    counts = sync_csvs_to_local_data(
-                        DATA_SOURCE_DIR_DEFAULT,
-                        LOCAL_DATA_DIR,
-                        overwrite=overwrite,
-                    )
-                    st.success(
-                        f"Sync complete: copied {counts['copied']} file(s), skipped {counts['skipped']} file(s)."
-                    )
-                except Exception as e:
-                    st.error(f"Sync failed: {e}")
+        overwrite = st.checkbox("Overwrite existing files on upload", value=False)
+        uploaded_files = st.file_uploader(
+            "Upload IP-MS CSV files",
+            type=["csv"],
+            accept_multiple_files=True,
+            help="Upload one or more CSVs. Files are saved to local Data/ for analysis.",
+        )
+        if uploaded_files:
+            try:
+                counts = save_uploaded_csvs_to_local_data(
+                    uploaded_files,
+                    LOCAL_DATA_DIR,
+                    overwrite=overwrite,
+                )
+                st.success(
+                    f"Upload complete: saved {counts['saved']} file(s), skipped {counts['skipped']} existing file(s)."
+                )
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
 
         if st.button("Refresh Data"):
             st.session_state["data_refresh_token"] += 1
+            load_portal_data.clear()
 
         local_csv_count = _count_csv_files(LOCAL_DATA_DIR)
         if local_csv_count == 0:
@@ -406,11 +410,11 @@ def main() -> None:
         meta_lookup = meta_by_file
         labels = {k: _pretty_dataset_label(k, meta_lookup.get(k, {})) for k in dataset_keys_all}
 
-        # Optional project grouping for faster access to active experiments.
+        # Bait-based project grouping for active experiments.
         current_project_keys = [
             k
             for k in dataset_keys_all
-            if ("BCL7A" in k.upper()) or ("SMARCE1" in k.upper())
+            if str(meta_lookup.get(k, {}).get("bait", "")).upper() in CURRENT_PROJECT_BAITS
         ]
         if current_project_keys:
             project_view = st.radio(
@@ -486,7 +490,12 @@ def main() -> None:
         df_view = df_gene.copy()
         df_view["Confidence Score"] = pd.to_numeric(df_view["Confidence Score"], errors="coerce")
         df_view["Spectral Count"] = pd.to_numeric(df_view["Spectral Count"], errors="coerce")
-        df_view = df_view.sort_values("Spectral Count", ascending=False)
+        # Put BAF core genes first while preserving highest-signal rows near top.
+        df_view = df_view.sort_values(
+            by=["is_baf_core", "Spectral Count", "Confidence Score"],
+            ascending=[False, False, False],
+            kind="mergesort",
+        )
 
         df_table = df_view[
             [
@@ -541,9 +550,10 @@ def main() -> None:
             "is_baf_core",
         ]
         df_cmp = merged[show_cols].copy()
+        df_cmp["is_baf_core"] = df_cmp["is_baf_core"].fillna(False)
         df_cmp = df_cmp.sort_values(
-            by=["category", "Spectral Count_A", "Spectral Count_B"],
-            ascending=[True, False, False],
+            by=["is_baf_core", "category", "Spectral Count_A", "Spectral Count_B"],
+            ascending=[False, True, False, False],
             kind="mergesort",
         )
 
