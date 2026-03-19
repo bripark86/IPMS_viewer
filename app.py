@@ -344,6 +344,134 @@ def _dataset_appearance_for_subunit(df_gene: pd.DataFrame, subunit: str) -> bool
     return bool(((df_gene["Gene Symbol"] == subunit) & (df_gene["Spectral Count"] > 0)).any())
 
 
+def _compute_storage_mb(file_names: list[str], data_dir: str) -> float:
+    total_bytes = 0
+    for fname in file_names:
+        fpath = os.path.join(data_dir, fname)
+        if os.path.exists(fpath):
+            total_bytes += os.path.getsize(fpath)
+    return total_bytes / (1024 * 1024)
+
+
+def _aggregated_download_name(meta: dict[str, Any], fallback_filename: str) -> str:
+    bait = (meta.get("bait") or "UnknownBait").replace(" ", "")
+    cell = (meta.get("cell_line") or "UnknownCell").replace(" ", "")
+    return f"{bait}_{cell}_Aggregated.csv"
+
+
+def _render_data_vault_tab(
+    *,
+    experiments_df: pd.DataFrame,
+    aggregated_by_file: dict[str, pd.DataFrame],
+    meta_by_file: dict[str, dict[str, Any]],
+    data_dir: str,
+) -> None:
+    st.markdown("### Data Vault: Experiment Directory")
+    if experiments_df.empty:
+        st.info(DATA_EMPTY_MESSAGE)
+        return
+
+    dataset_keys = experiments_df["filename"].tolist()
+    unique_baits = int(experiments_df["bait"].dropna().nunique()) if "bait" in experiments_df.columns else 0
+    storage_mb = _compute_storage_mb(dataset_keys, data_dir)
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Total Experiments Stored", f"{len(dataset_keys)}")
+    s2.metric("Unique Baits", f"{unique_baits}")
+    s3.metric("Storage Used (MB)", f"{storage_mb:.2f}")
+
+    st.markdown("#### Search & Metadata")
+    bait_query = st.text_input("Search by Bait", placeholder="Type bait (e.g., BCL7, SMARCE1)")
+    bait_query_u = bait_query.strip().upper()
+
+    filtered_df = experiments_df.copy()
+    if bait_query_u:
+        filtered_df = filtered_df[
+            filtered_df["bait"].fillna("").astype(str).str.upper().str.contains(bait_query_u, na=False)
+        ]
+
+    meta_table = filtered_df.copy()
+    meta_table["Processed Date"] = pd.to_datetime(meta_table["mtime"], unit="s", errors="coerce")
+    meta_table["Processed Date"] = meta_table["Processed Date"].dt.strftime("%Y-%m-%d %H:%M")
+    meta_table = meta_table.rename(
+        columns={
+            "filename": "Filename",
+            "bait": "Bait",
+            "cell_line": "Cell Line",
+            "replicate": "Replicate",
+        }
+    )
+    meta_table = meta_table[["Filename", "Bait", "Cell Line", "Replicate", "Processed Date"]]
+    st.dataframe(meta_table, use_container_width=True, height=280)
+
+    st.markdown("#### Experiment Cards")
+    keys_for_cards = filtered_df["filename"].tolist()
+    if not keys_for_cards:
+        st.caption("No experiments match the current bait filter.")
+        return
+
+    cols_per_row = 3
+    for i in range(0, len(keys_for_cards), cols_per_row):
+        row_keys = keys_for_cards[i : i + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for j, key in enumerate(row_keys):
+            meta = meta_by_file.get(key, {})
+            bait = meta.get("bait") or "NA"
+            cell = meta.get("cell_line") or "NA"
+            rep = meta.get("replicate")
+            rep_text = str(rep) if rep is not None else "NA"
+            is_baf_bait = str(bait).upper() in set(BAF_SUBUNITS)
+            bait_tag = " <span style='color:#FF4B4B;'>● BAF</span>" if is_baf_bait else ""
+            df_agg = aggregated_by_file.get(key)
+
+            with cols[j]:
+                st.markdown(
+                    (
+                        "<div class='card'>"
+                        f"<h4 style='margin:0 0 6px 0;'><b>{bait}</b>{bait_tag}</h4>"
+                        f"<div style='opacity:0.9; margin-bottom:4px;'>Cell Line: {cell}</div>"
+                        f"<div style='opacity:0.9; margin-bottom:8px;'>Replicate: {rep_text}</div>"
+                        f"<div style='font-size:0.9rem; opacity:0.8; word-break:break-word;'>{key}</div>"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+                if df_agg is not None and not df_agg.empty:
+                    df_download = df_agg.copy().sort_values(
+                        by=["is_baf_core", "Spectral Count", "Confidence Score"],
+                        ascending=[False, False, False],
+                        kind="mergesort",
+                    )
+                    csv_bytes = df_download.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download CSV",
+                        data=csv_bytes,
+                        file_name=_aggregated_download_name(meta, key),
+                        mime="text/csv",
+                        key=f"download_{key}",
+                    )
+                else:
+                    st.caption("Aggregated data unavailable for download.")
+
+                confirm_key = f"confirm_delete_{key}"
+                delete_key = f"delete_{key}"
+                st.checkbox("Confirm delete", key=confirm_key)
+                if st.button("Delete", key=delete_key):
+                    if st.session_state.get(confirm_key, False):
+                        try:
+                            path = os.path.join(data_dir, key)
+                            if os.path.exists(path):
+                                os.remove(path)
+                            load_portal_data.clear()
+                            st.success(f"Deleted `{key}`.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed for `{key}`: {e}")
+                    else:
+                        st.warning("Tick 'Confirm delete' before deleting this file.")
+
+
 def main() -> None:
     st.set_page_config(page_title="BAF-Complex IP-MS Analytics Portal", layout="wide")
     # Inject CSS at app startup so it applies globally.
@@ -466,8 +594,10 @@ def main() -> None:
 
     df_gene = aggregated_by_file[selected_dataset]
 
-    # Tabs: Main vs Comparison
-    tab_main, tab_cmp = st.tabs(["Main Dashboard", "Comparison Mode"])
+    # Tabs: Main, Comparison, and Data Vault directory.
+    tab_main, tab_cmp, tab_vault = st.tabs(
+        ["Main Dashboard", "Comparison Mode", "Data Vault: Experiment Directory"]
+    )
 
     with tab_main:
         # KPI metrics
@@ -585,6 +715,14 @@ def main() -> None:
                 st.caption("No BAF-core genes found in either dataset.")
         except Exception as e:
             st.error(f"Comparison failed: unable to compute overlap for the selected datasets. Details: {e}")
+
+    with tab_vault:
+        _render_data_vault_tab(
+            experiments_df=experiments_df,
+            aggregated_by_file=aggregated_by_file,
+            meta_by_file=meta_by_file,
+            data_dir=LOCAL_DATA_DIR,
+        )
 
 
 if __name__ == "__main__":
