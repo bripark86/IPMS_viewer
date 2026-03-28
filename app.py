@@ -344,6 +344,131 @@ def _dataset_appearance_for_subunit(df_gene: pd.DataFrame, subunit: str) -> bool
     return bool(((df_gene["Gene Symbol"] == subunit) & (df_gene["Spectral Count"] > 0)).any())
 
 
+BAF_SUBUNIT_SET = set(BAF_SUBUNITS)
+
+
+def search_gene_across_datasets(
+    gene_query: str,
+    aggregated_by_file: dict[str, pd.DataFrame],
+    meta_by_file: dict[str, dict[str, Any]],
+) -> pd.DataFrame:
+    """
+    Cross-dataset index: scan cached gene-level dataframes only (no disk re-read).
+    Returns a summary table sorted by Spectral Count descending.
+    """
+    q = str(gene_query).strip()
+    if not q:
+        return pd.DataFrame()
+
+    q_upper = q.upper()
+    rows: list[dict[str, Any]] = []
+
+    for filename, df_gene in aggregated_by_file.items():
+        if df_gene is None or df_gene.empty or "Gene Symbol" not in df_gene.columns:
+            continue
+        mask = df_gene["Gene Symbol"].astype(str).str.strip().str.upper() == q_upper
+        hit = df_gene.loc[mask]
+        if hit.empty:
+            continue
+        row = hit.iloc[0]
+        meta = meta_by_file.get(filename, {})
+        rows.append(
+            {
+                "Bait": meta.get("bait"),
+                "Cell Line": meta.get("cell_line"),
+                "Spectral Count": row.get("Spectral Count"),
+                "Unique Peptides": row.get("Unique Peptides"),
+                "Confidence Score": row.get("Confidence Score"),
+                "Dataset Date/ID": filename,
+                "_filename": filename,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out["Spectral Count"] = pd.to_numeric(out["Spectral Count"], errors="coerce")
+    out = out.sort_values("Spectral Count", ascending=False, kind="mergesort").reset_index(drop=True)
+    return out
+
+
+def _style_global_search_results(df_display: pd.DataFrame, *, target_is_baf_core: bool) -> Any:
+    """Highlight all rows when the searched protein is a BAF core subunit."""
+    if not target_is_baf_core or df_display.empty:
+        return df_display
+
+    def highlight_row(_row: pd.Series) -> list[str]:
+        style = f"background-color: {BAF_CORE_COLOR}; color: #FFFFFF; font-weight: 600;"
+        return [style] * len(_row)
+
+    return df_display.style.apply(highlight_row, axis=1)
+
+
+def _render_global_search_tab(
+    *,
+    gene_input: str,
+    aggregated_by_file: dict[str, pd.DataFrame],
+    meta_by_file: dict[str, dict[str, Any]],
+) -> None:
+    st.markdown("### Global Protein Search")
+    st.caption(
+        "Search across all experiments using cached gene-level results (no extra file reads)."
+    )
+
+    q = gene_input.strip()
+    if not q:
+        st.info("Enter a Gene Symbol in the sidebar under **Global Protein Search** to search the library.")
+        return
+
+    results = search_gene_across_datasets(q, aggregated_by_file, meta_by_file)
+    target_baf = q.strip().upper() in BAF_SUBUNIT_SET
+
+    if target_baf:
+        st.markdown(
+            "<span style='background:#FF4B4B;color:#fff;padding:4px 10px;border-radius:8px;font-weight:700;'>BAF Core</span>",
+            unsafe_allow_html=True,
+        )
+
+    if results.empty:
+        st.info(f"No detections found for **{q}** in current library.")
+        return
+
+    max_sc = int(results["Spectral Count"].max()) if results["Spectral Count"].notna().any() else 0
+    r_rank = results.copy()
+    r_rank["Confidence Score"] = pd.to_numeric(r_rank["Confidence Score"], errors="coerce")
+    r_rank = r_rank.sort_values(
+        by=["Spectral Count", "Confidence Score"],
+        ascending=[False, False],
+        kind="mergesort",
+    )
+    primary_bait = r_rank.iloc[0]["Bait"]
+    if pd.isna(primary_bait) or primary_bait is None:
+        primary_bait = "NA"
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total Hits", f"{len(results)}")
+    m2.metric("Highest Enrichment", f"{max_sc}")
+    m3.metric("Primary Interaction", str(primary_bait))
+
+    df_show = results.drop(columns=["_filename"], errors="ignore").copy()
+
+    st.markdown("#### Results")
+    styler = _style_global_search_results(df_show, target_is_baf_core=target_baf)
+    st.dataframe(styler, use_container_width=True, height=min(520, 42 + 36 * len(df_show)))
+
+    st.markdown("#### Open in Dataset Browser")
+    for i, r in results.iterrows():
+        fn = r.get("_filename")
+        if not fn:
+            continue
+        label = f"Open **{fn}** in browser"
+        if st.button(label, key=f"global_open_{fn}_{i}"):
+            st.session_state["portal_project_view"] = "All Experiments"
+            st.session_state["portal_dataset_select"] = fn
+            st.rerun()
+
+
 def _compute_storage_mb(file_names: list[str], data_dir: str) -> float:
     total_bytes = 0
     for fname in file_names:
@@ -480,14 +605,12 @@ def main() -> None:
     st.title("BAF-Complex IP-MS Analytics Portal")
     st.caption("Peptide-level CSVs are aggregated to gene-level for PI-friendly interpretation.")
 
+    matching: list[str] = []
     with st.sidebar:
         _ensure_local_data_dir()
 
         if "data_refresh_token" not in st.session_state:
             st.session_state["data_refresh_token"] = 0
-        if "jump_key" not in st.session_state:
-            st.session_state["jump_key"] = None
-
         st.markdown("### Data Directory & File Management")
         st.caption(f"Local data: `{LOCAL_DATA_DIR}`")
 
@@ -545,31 +668,51 @@ def main() -> None:
             if str(meta_lookup.get(k, {}).get("bait", "")).upper() in CURRENT_PROJECT_BAITS
         ]
         if current_project_keys:
-            project_view = st.radio(
+            if "portal_project_view" not in st.session_state:
+                st.session_state["portal_project_view"] = "Current Projects"
+            st.radio(
                 "Project View",
                 ["Current Projects", "All Experiments"],
-                index=0,
                 horizontal=True,
+                key="portal_project_view",
             )
+            project_view = str(st.session_state.get("portal_project_view", "All Experiments"))
         else:
+            st.session_state["portal_project_view"] = "All Experiments"
             project_view = "All Experiments"
 
         dataset_keys_for_picker = (
             current_project_keys if project_view == "Current Projects" else dataset_keys_all
         )
 
-        selected_dataset = st.selectbox(
+        if not dataset_keys_for_picker:
+            dataset_keys_for_picker = dataset_keys_all
+
+        ds_cur = st.session_state.get("portal_dataset_select")
+        if ds_cur not in dataset_keys_for_picker and dataset_keys_for_picker:
+            st.session_state["portal_dataset_select"] = dataset_keys_for_picker[0]
+
+        st.selectbox(
             "Select dataset",
             options=dataset_keys_for_picker,
             format_func=lambda k: labels.get(k, k),
-            index=0,
+            key="portal_dataset_select",
+        )
+
+        st.markdown("---")
+        st.markdown("### Global Protein Search")
+        st.text_input(
+            "Gene Symbol (all experiments)",
+            placeholder="e.g. ACTL6A, MYC",
+            key="global_gene_query",
+            help="Open the **Global Search** tab for the full cross-experiment table and metrics.",
         )
 
         st.markdown("---")
         st.markdown("### Subunit Quick-Search")
         selected_subunit = st.selectbox("BAF subunit", options=BAF_SUBUNITS, index=0)
 
-        matching = []
+        matching.clear()
         for key in dataset_keys_all:
             df_gene = aggregated_by_file.get(key)
             if df_gene is None:
@@ -580,23 +723,31 @@ def main() -> None:
         st.write(f"Detected in {len(matching)} experiment(s).")
 
         if matching:
-            jump_key = st.selectbox(
+            if st.session_state.get("subunit_jump_dataset") not in matching:
+                st.session_state["subunit_jump_dataset"] = matching[0]
+            st.selectbox(
                 "Jump to matching dataset",
                 options=matching,
-                index=0,
                 format_func=lambda k: labels.get(k, k),
+                key="subunit_jump_dataset",
             )
-        else:
-            jump_key = selected_dataset
 
-    # If the jump selector changed, override the dashboard dataset.
-    selected_dataset = jump_key
+    # Subunit jump overrides the main dataset picker when matches exist.
+    if matching:
+        selected_dataset = str(st.session_state.get("subunit_jump_dataset", dataset_keys_all[0]))
+    else:
+        selected_dataset = str(st.session_state.get("portal_dataset_select", dataset_keys_all[0]))
 
     df_gene = aggregated_by_file[selected_dataset]
 
-    # Tabs: Main, Comparison, and Data Vault directory.
-    tab_main, tab_cmp, tab_vault = st.tabs(
-        ["Main Dashboard", "Comparison Mode", "Data Vault: Experiment Directory"]
+    # Tabs: Main, Comparison, Data Vault, and Global Search.
+    tab_main, tab_cmp, tab_vault, tab_global = st.tabs(
+        [
+            "Main Dashboard",
+            "Comparison Mode",
+            "Data Vault: Experiment Directory",
+            "Global Search",
+        ]
     )
 
     with tab_main:
@@ -722,6 +873,13 @@ def main() -> None:
             aggregated_by_file=aggregated_by_file,
             meta_by_file=meta_by_file,
             data_dir=LOCAL_DATA_DIR,
+        )
+
+    with tab_global:
+        _render_global_search_tab(
+            gene_input=str(st.session_state.get("global_gene_query", "")),
+            aggregated_by_file=aggregated_by_file,
+            meta_by_file=meta_by_file,
         )
 
 
