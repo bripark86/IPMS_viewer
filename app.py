@@ -1243,6 +1243,86 @@ def main() -> None:
             if not runs:
                 st.warning("No experiments matched this bait (check filenames/labels).")
             else:
+                with st.expander("Show Experiment Details", expanded=False):
+                    st.markdown("#### Matching metadata")
+                    run_rows: list[dict[str, Any]] = []
+                    for fk in sorted(runs):
+                        m = meta_by_file.get(fk, {})
+                        run_rows.append(
+                            {
+                                "Investigator": m.get("investigator") or "—",
+                                "Session ID": m.get("session_id") or "—",
+                                "Label": m.get("label") or "—",
+                                "Cell Line": m.get("cell_line") or "—",
+                                "File": m.get("filename") or str(fk).split("/")[-1],
+                            }
+                        )
+                    meta_runs = pd.DataFrame(run_rows)
+                    meta_runs = meta_runs.sort_values(
+                        by=["Investigator", "Session ID", "File"],
+                        kind="mergesort",
+                    ).reset_index(drop=True)
+
+                    researchers = sorted(
+                        {str(x) for x in meta_runs["Investigator"].tolist() if str(x) not in ("—", "N/A", "nan", "")}
+                    )
+                    if researchers:
+                        st.markdown(
+                            "**Contributing researchers:** "
+                            + ", ".join(f"**{r}**" for r in researchers)
+                        )
+                    else:
+                        st.caption("Investigator not parsed for some runs; check `Data/[Investigator]/` layout.")
+
+                    inv_counts = meta_runs["Investigator"].value_counts()
+                    cell_counts = meta_runs["Cell Line"].value_counts()
+
+                    bc1, bc2 = st.columns(2)
+                    h_inv = max(180, 48 + 28 * len(inv_counts))
+                    h_cell = max(180, 48 + 28 * len(cell_counts))
+                    with bc1:
+                        st.caption("Runs by investigator")
+                        fig_i = go.Figure(
+                            go.Bar(
+                                x=inv_counts.values,
+                                y=inv_counts.index.astype(str),
+                                orientation="h",
+                                marker=dict(color="#00A6ED"),
+                            )
+                        )
+                        fig_i.update_layout(
+                            template="plotly_dark",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            margin=dict(l=120, r=10, t=10, b=30),
+                            height=h_inv,
+                            xaxis_title="Number of runs",
+                            yaxis_title="",
+                        )
+                        st.plotly_chart(fig_i, use_container_width=True)
+                    with bc2:
+                        st.caption("Runs by cell line")
+                        fig_c = go.Figure(
+                            go.Bar(
+                                x=cell_counts.values,
+                                y=cell_counts.index.astype(str),
+                                orientation="h",
+                                marker=dict(color="#7C4DFF"),
+                            )
+                        )
+                        fig_c.update_layout(
+                            template="plotly_dark",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            margin=dict(l=120, r=10, t=10, b=30),
+                            height=h_cell,
+                            xaxis_title="Number of runs",
+                            yaxis_title="",
+                        )
+                        st.plotly_chart(fig_c, use_container_width=True)
+
+                    st.dataframe(meta_runs, use_container_width=True, height=min(360, 72 + 28 * len(meta_runs)))
+
                 cons = _lab_consensus_table(runs, aggregated_by_file, min_fraction=0.5)
                 if cons.empty:
                     st.info("No proteins exceeded 50% prevalence across these runs.")
