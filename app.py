@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
@@ -8,9 +9,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from ipms_portal.biological_aliases import BAF_SUBUNIT_SET, expand_biological_target_string
 from ipms_portal.constants import BAF_CORE_COLOR, BAF_SUBUNITS
 from ipms_portal.data_processing import (
     add_baf_core_indicator,
+    add_experiment_biological_columns,
+    enrich_meta_dict,
     load_and_aggregate_csv,
     scan_csv_files,
 )
@@ -52,9 +56,9 @@ def _ensure_local_data_dir() -> None:
 def _count_csv_files(data_dir: str) -> int:
     try:
         count = 0
-        with os.scandir(data_dir) as it:
-            for entry in it:
-                if entry.is_file() and entry.name.lower().endswith(".csv"):
+        for _root, _dirs, files in os.walk(data_dir):
+            for f in files:
+                if f.lower().endswith(".csv"):
                     count += 1
         return count
     except FileNotFoundError:
@@ -65,13 +69,15 @@ def save_uploaded_csvs_to_local_data(
     uploaded_files: list[Any],
     dest_dir: str,
     *,
+    subfolder: str = "Imported",
     overwrite: bool = False,
 ) -> dict[str, int]:
     """
-    Save uploaded CSVs to local Data directory.
+    Save uploaded CSVs under Data/<subfolder>/ (creates nested layout).
     Returns counts: {'saved': X, 'skipped': Y}.
     """
-    os.makedirs(dest_dir, exist_ok=True)
+    target_root = os.path.join(dest_dir, subfolder.strip().replace("..", "").strip(os.sep) or "Imported")
+    os.makedirs(target_root, exist_ok=True)
     saved = 0
     skipped = 0
 
@@ -81,7 +87,8 @@ def save_uploaded_csvs_to_local_data(
         name = getattr(uploaded, "name", "")
         if not str(name).lower().endswith(".csv"):
             continue
-        dst_path = os.path.join(dest_dir, name)
+        safe_name = os.path.basename(name)
+        dst_path = os.path.join(target_root, safe_name)
         if (not overwrite) and os.path.exists(dst_path):
             skipped += 1
             continue
@@ -92,12 +99,149 @@ def save_uploaded_csvs_to_local_data(
     return {"saved": saved, "skipped": skipped}
 
 
-def _pretty_dataset_label(filename: str, meta: dict[str, Any]) -> str:
-    cl = meta.get("cell_line") or "NA"
-    bait = meta.get("bait") or "NA"
-    rep = meta.get("replicate")
-    rep_s = str(rep) if rep is not None else "NA"
-    return f"Bait: {bait} | Cell: {cl} | Rep {rep_s} | {filename}"
+def _pretty_dataset_label(file_key: str, meta: dict[str, Any]) -> str:
+    inv = meta.get("investigator") or "N/A"
+    sid = meta.get("session_id") or "N/A"
+    bait = meta.get("bait") or "N/A"
+    lbl = meta.get("label") or "N/A"
+    return f"[{inv}] {sid} | Bait:{bait} | {lbl} | {file_key}"
+
+
+def _meta_matches_bait(meta: dict[str, Any], bait_q: str) -> bool:
+    q = bait_q.strip().upper()
+    if not q:
+        return False
+    if str(meta.get("bait", "")).upper() == q:
+        return True
+    if q in expand_biological_target_string(str(meta.get("biological_target", ""))):
+        return True
+    lab = str(meta.get("label", "")).upper()
+    if q in lab.split("_"):
+        return True
+    return False
+
+
+def _lab_consensus_table(
+    run_keys: list[str],
+    aggregated_by_file: dict[str, pd.DataFrame],
+    *,
+    min_fraction: float = 0.5,
+) -> pd.DataFrame:
+    if not run_keys:
+        return pd.DataFrame()
+    gene_sets: list[set[str]] = []
+    spec_lists: list[pd.Series] = []
+    for rk in run_keys:
+        df = aggregated_by_file.get(rk)
+        if df is None or df.empty:
+            gene_sets.append(set())
+            spec_lists.append(pd.Series(dtype=float))
+            continue
+        gs = set(df.loc[df["Spectral Count"].fillna(0) > 0, "Gene Symbol"].astype(str))
+        gene_sets.append(gs)
+        spec_lists.append(df.set_index("Gene Symbol")["Spectral Count"])
+    if not gene_sets:
+        return pd.DataFrame()
+
+    universe: set[str] = set()
+    for gs in gene_sets:
+        universe |= gs
+
+    rows: list[dict[str, Any]] = []
+    eff_n = len(gene_sets)
+    for gene in sorted(universe):
+        cnt = sum(1 for gs in gene_sets if gene in gs)
+        if eff_n <= 0:
+            continue
+        if (cnt / eff_n) <= min_fraction:
+            continue
+        vals: list[float] = []
+        for s in spec_lists:
+            if gene in s.index:
+                try:
+                    vals.append(float(s.loc[gene]))
+                except Exception:
+                    continue
+        if not vals:
+            continue
+        rows.append(
+            {
+                "Gene Symbol": gene,
+                "Runs With Hit": cnt,
+                "Fraction of Runs": round(cnt / eff_n, 3),
+                "Mean Spectral Count": float(np.mean(vals)),
+                "is_baf_core": gene in BAF_SUBUNIT_SET,
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out = out.sort_values(by=["Fraction of Runs", "Mean Spectral Count"], ascending=[False, False]).reset_index(
+        drop=True
+    )
+    return out
+
+
+def _scatter_matrix_spectral(
+    selected_keys: list[str],
+    aggregated_by_file: dict[str, pd.DataFrame],
+    meta_by_file: dict[str, dict[str, Any]],
+) -> go.Figure:
+    genes: set[str] = set()
+    for k in selected_keys:
+        df = aggregated_by_file.get(k)
+        if df is not None and not df.empty:
+            genes.update(df["Gene Symbol"].astype(str).tolist())
+
+    short_labels: dict[str, str] = {}
+    for k in selected_keys:
+        m = meta_by_file.get(k, {})
+        fn = m.get("filename") or k.split("/")[-1]
+        short_labels[k] = (fn[:28] + "…") if len(fn) > 28 else fn
+
+    rows_data: list[dict[str, Any]] = []
+    for g in genes:
+        row: dict[str, Any] = {"Gene": g, "is_baf": g in BAF_SUBUNIT_SET}
+        for k in selected_keys:
+            df = aggregated_by_file.get(k)
+            if df is None or df.empty:
+                row[short_labels[k]] = 0.0
+                continue
+            hit = df[df["Gene Symbol"].astype(str) == g]
+            row[short_labels[k]] = float(hit["Spectral Count"].iloc[0]) if not hit.empty else 0.0
+        rows_data.append(row)
+
+    dfm = pd.DataFrame(rows_data)
+    dim_cols = [short_labels[k] for k in selected_keys]
+    colors = [BAF_CORE_COLOR if bool(b) else "#00A6ED" for b in dfm["is_baf"]]
+    sizes = [11 if bool(b) else 6 for b in dfm["is_baf"]]
+
+    dims = [dict(label=c, values=dfm[c]) for c in dim_cols]
+    fig = go.Figure(
+        data=go.Splom(
+            dimensions=dims,
+            marker=dict(
+                color=colors,
+                size=sizes,
+                line=dict(width=0.4, color="rgba(255,255,255,0.65)"),
+                opacity=0.9,
+            ),
+            text=dfm["Gene"],
+            hovertemplate="<b>%{text}</b><br>%{xaxis.title.text}: %{x}<br>%{yaxis.title.text}: %{y}<extra></extra>",
+            showupperhalf=True,
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        title="Spectral Count — multi-experiment scatter matrix (BAF genes emphasized)",
+        dragmode="select",
+        font=dict(color="#E6EDF3"),
+        margin=dict(l=40, r=20, t=60, b=40),
+        height=640,
+    )
+    return fig
 
 
 def _pick_top_interactor(df: pd.DataFrame) -> str | None:
@@ -131,9 +275,9 @@ def load_portal_data(
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, dict[str, Any]], list[str]]:
     """
     Returns:
-    - experiments_df: one row per file (metadata + key)
-    - aggregated_by_file: mapping filename -> gene-level aggregated df (with is_baf_core)
-    - meta_by_file: mapping filename -> dict meta fields (for UI labeling)
+    - experiments_df: one row per file (metadata + file_key)
+    - aggregated_by_file: mapping file_key -> gene-level aggregated df (with is_baf_core, bio columns)
+    - meta_by_file: mapping file_key -> dict meta fields (for UI labeling)
     """
     _ = refresh_token  # included to force cache invalidation on refresh
     metas = scan_csv_files(data_dir)
@@ -146,31 +290,35 @@ def load_portal_data(
         try:
             df_gene = load_and_aggregate_csv(meta.path)
             df_gene = add_baf_core_indicator(df_gene, BAF_SUBUNITS)
-            aggregated_by_file[meta.filename] = df_gene
+            enriched = enrich_meta_dict(meta)
+            df_gene = add_experiment_biological_columns(
+                df_gene,
+                biological_target=str(enriched.get("biological_target", "N/A")),
+                domain_details=str(enriched.get("domain_details", "N/A")),
+            )
+            aggregated_by_file[meta.file_key] = df_gene
 
-            cell_line = meta.cell_line
-            bait = meta.bait
-            rep = meta.replicate
             experiments_rows.append(
                 {
+                    "file_key": meta.file_key,
                     "filename": meta.filename,
-                    "cell_line": cell_line,
-                    "bait": bait,
-                    "replicate": rep,
+                    "investigator": enriched.get("investigator"),
+                    "session_id": enriched.get("session_id"),
+                    "initials": enriched.get("initials"),
+                    "label": enriched.get("label"),
+                    "cell_line": enriched.get("cell_line"),
+                    "bait": enriched.get("bait"),
+                    "biological_target": enriched.get("biological_target"),
+                    "domain_details": enriched.get("domain_details"),
                     "mtime": meta.mtime,
+                    "path": enriched.get("path"),
                     "n_proteins": int(df_gene["Gene Symbol"].nunique()),
                     "n_baf_core": int(df_gene["is_baf_core"].sum()),
                 }
             )
-            meta_by_file[meta.filename] = {
-                "cell_line": cell_line,
-                "bait": bait,
-                "replicate": rep,
-                "mtime": meta.mtime,
-            }
+            meta_by_file[meta.file_key] = dict(enriched)
         except Exception:
-            # Skip files that truly cannot be parsed.
-            skipped_files.append(meta.filename)
+            skipped_files.append(meta.file_key)
             continue
 
     experiments_df = pd.DataFrame(experiments_rows)
@@ -341,10 +489,9 @@ def _comparison_table(df_a: pd.DataFrame, df_b: pd.DataFrame) -> pd.DataFrame:
 
 
 def _dataset_appearance_for_subunit(df_gene: pd.DataFrame, subunit: str) -> bool:
-    return bool(((df_gene["Gene Symbol"] == subunit) & (df_gene["Spectral Count"] > 0)).any())
-
-
-BAF_SUBUNIT_SET = set(BAF_SUBUNITS)
+    u = subunit.strip().upper()
+    sy = df_gene["Gene Symbol"].astype(str).str.strip().str.upper()
+    return bool(((sy == u) & (df_gene["Spectral Count"].fillna(0) > 0)).any())
 
 
 def search_gene_across_datasets(
@@ -353,8 +500,8 @@ def search_gene_across_datasets(
     meta_by_file: dict[str, dict[str, Any]],
 ) -> pd.DataFrame:
     """
-    Cross-dataset index: scan cached gene-level dataframes only (no disk re-read).
-    Returns a summary table sorted by Spectral Count descending.
+    Cross-dataset index over cached gene-level frames. SWIFT/SMARCD1–3 mapping: runs whose
+    resolved Biological Target contains the query appear in the index (with observed quantities).
     """
     q = str(gene_query).strip()
     if not q:
@@ -363,24 +510,47 @@ def search_gene_across_datasets(
     q_upper = q.upper()
     rows: list[dict[str, Any]] = []
 
-    for filename, df_gene in aggregated_by_file.items():
+    for file_key, df_gene in aggregated_by_file.items():
         if df_gene is None or df_gene.empty or "Gene Symbol" not in df_gene.columns:
             continue
+        meta = meta_by_file.get(file_key, {})
+        bio = str(meta.get("biological_target", "N/A"))
+        bio_expanded = expand_biological_target_string(bio)
+        index_match = q_upper in bio_expanded
+
         mask = df_gene["Gene Symbol"].astype(str).str.strip().str.upper() == q_upper
         hit = df_gene.loc[mask]
+
         if hit.empty:
+            if not index_match:
+                continue
+            rows.append(
+                {
+                    "Investigator": meta.get("investigator") or "N/A",
+                    "Session ID": meta.get("session_id") or "N/A",
+                    "Label": meta.get("label") or "N/A",
+                    "Bio-Target": bio,
+                    "Spectral Count": 0,
+                    "Unique Peptides": 0,
+                    "Avg LDA": np.nan,
+                    "Dataset ID": meta.get("filename") or file_key.split("/")[-1],
+                    "_file_key": file_key,
+                }
+            )
             continue
+
         row = hit.iloc[0]
-        meta = meta_by_file.get(filename, {})
         rows.append(
             {
-                "Bait": meta.get("bait"),
-                "Cell Line": meta.get("cell_line"),
+                "Investigator": meta.get("investigator") or "N/A",
+                "Session ID": meta.get("session_id") or "N/A",
+                "Label": meta.get("label") or "N/A",
+                "Bio-Target": bio,
                 "Spectral Count": row.get("Spectral Count"),
                 "Unique Peptides": row.get("Unique Peptides"),
-                "Confidence Score": row.get("Confidence Score"),
-                "Dataset Date/ID": filename,
-                "_filename": filename,
+                "Avg LDA": row.get("Confidence Score"),
+                "Dataset ID": meta.get("filename") or file_key.split("/")[-1],
+                "_file_key": file_key,
             }
         )
 
@@ -434,24 +604,25 @@ def _render_global_search_tab(
         st.info(f"No detections found for **{q}** in current library.")
         return
 
-    max_sc = int(results["Spectral Count"].max()) if results["Spectral Count"].notna().any() else 0
+    r_obs = results[results["Spectral Count"].fillna(0) > 0]
+    max_sc = int(r_obs["Spectral Count"].max()) if not r_obs.empty and r_obs["Spectral Count"].notna().any() else 0
     r_rank = results.copy()
-    r_rank["Confidence Score"] = pd.to_numeric(r_rank["Confidence Score"], errors="coerce")
+    r_rank["Avg LDA"] = pd.to_numeric(r_rank["Avg LDA"], errors="coerce")
     r_rank = r_rank.sort_values(
-        by=["Spectral Count", "Confidence Score"],
+        by=["Spectral Count", "Avg LDA"],
         ascending=[False, False],
         kind="mergesort",
     )
-    primary_bait = r_rank.iloc[0]["Bait"]
-    if pd.isna(primary_bait) or primary_bait is None:
-        primary_bait = "NA"
+    top = r_rank.iloc[0]
+    meta0 = meta_by_file.get(str(top.get("_file_key", "")), {})
+    primary_bait = meta0.get("bait") or meta0.get("biological_target") or "N/A"
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total Hits", f"{len(results)}")
     m2.metric("Highest Enrichment", f"{max_sc}")
     m3.metric("Primary Interaction", str(primary_bait))
 
-    df_show = results.drop(columns=["_filename"], errors="ignore").copy()
+    df_show = results.drop(columns=["_file_key"], errors="ignore").copy()
 
     st.markdown("#### Results")
     styler = _style_global_search_results(df_show, target_is_baf_core=target_baf)
@@ -459,22 +630,27 @@ def _render_global_search_tab(
 
     st.markdown("#### Open in Dataset Browser")
     for i, r in results.iterrows():
-        fn = r.get("_filename")
-        if not fn:
+        fk = r.get("_file_key")
+        if not fk:
             continue
-        label = f"Open **{fn}** in browser"
-        if st.button(label, key=f"global_open_{fn}_{i}"):
+        ds_id = r.get("Dataset ID", fk)
+        label = f"Open **{ds_id}**"
+        if st.button(label, key=f"global_open_{fk}_{i}"):
             st.session_state["portal_project_view"] = "All Experiments"
-            st.session_state["portal_dataset_select"] = fn
+            st.session_state["portal_dataset_select"] = fk
             st.rerun()
 
 
-def _compute_storage_mb(file_names: list[str], data_dir: str) -> float:
+def _compute_storage_mb_under_dir(data_dir: str) -> float:
     total_bytes = 0
-    for fname in file_names:
-        fpath = os.path.join(data_dir, fname)
-        if os.path.exists(fpath):
-            total_bytes += os.path.getsize(fpath)
+    for root, _dirs, files in os.walk(data_dir):
+        for f in files:
+            if f.lower().endswith(".csv"):
+                fp = os.path.join(root, f)
+                try:
+                    total_bytes += os.path.getsize(fp)
+                except OSError:
+                    continue
     return total_bytes / (1024 * 1024)
 
 
@@ -491,17 +667,17 @@ def _render_data_vault_tab(
     meta_by_file: dict[str, dict[str, Any]],
     data_dir: str,
 ) -> None:
-    st.markdown("### Data Vault: Experiment Directory")
+    st.markdown("### BAF-Vault: Experiment Directory")
     if experiments_df.empty:
         st.info(DATA_EMPTY_MESSAGE)
         return
 
-    dataset_keys = experiments_df["filename"].tolist()
+    file_keys = experiments_df["file_key"].astype(str).tolist()
     unique_baits = int(experiments_df["bait"].dropna().nunique()) if "bait" in experiments_df.columns else 0
-    storage_mb = _compute_storage_mb(dataset_keys, data_dir)
+    storage_mb = _compute_storage_mb_under_dir(data_dir)
 
     s1, s2, s3 = st.columns(3)
-    s1.metric("Total Experiments Stored", f"{len(dataset_keys)}")
+    s1.metric("Total Experiments Stored", f"{len(file_keys)}")
     s2.metric("Unique Baits", f"{unique_baits}")
     s3.metric("Storage Used (MB)", f"{storage_mb:.2f}")
 
@@ -518,19 +694,32 @@ def _render_data_vault_tab(
     meta_table = filtered_df.copy()
     meta_table["Processed Date"] = pd.to_datetime(meta_table["mtime"], unit="s", errors="coerce")
     meta_table["Processed Date"] = meta_table["Processed Date"].dt.strftime("%Y-%m-%d %H:%M")
-    meta_table = meta_table.rename(
+    show = meta_table[
+        [
+            "file_key",
+            "investigator",
+            "session_id",
+            "label",
+            "bait",
+            "biological_target",
+            "domain_details",
+            "Processed Date",
+        ]
+    ].rename(
         columns={
-            "filename": "Filename",
+            "file_key": "Path",
+            "investigator": "Investigator",
+            "session_id": "Session ID",
+            "label": "Label",
             "bait": "Bait",
-            "cell_line": "Cell Line",
-            "replicate": "Replicate",
+            "biological_target": "Bio-Target",
+            "domain_details": "Domain/Details",
         }
     )
-    meta_table = meta_table[["Filename", "Bait", "Cell Line", "Replicate", "Processed Date"]]
-    st.dataframe(meta_table, use_container_width=True, height=280)
+    st.dataframe(show, use_container_width=True, height=280)
 
     st.markdown("#### Experiment Cards")
-    keys_for_cards = filtered_df["filename"].tolist()
+    keys_for_cards = filtered_df["file_key"].astype(str).tolist()
     if not keys_for_cards:
         st.caption("No experiments match the current bait filter.")
         return
@@ -539,24 +728,27 @@ def _render_data_vault_tab(
     for i in range(0, len(keys_for_cards), cols_per_row):
         row_keys = keys_for_cards[i : i + cols_per_row]
         cols = st.columns(cols_per_row)
-        for j, key in enumerate(row_keys):
-            meta = meta_by_file.get(key, {})
+        for j, fk in enumerate(row_keys):
+            meta = meta_by_file.get(fk, {})
             bait = meta.get("bait") or "NA"
-            cell = meta.get("cell_line") or "NA"
-            rep = meta.get("replicate")
-            rep_text = str(rep) if rep is not None else "NA"
-            is_baf_bait = str(bait).upper() in set(BAF_SUBUNITS)
+            inv = meta.get("investigator") or "NA"
+            sid = meta.get("session_id") or "NA"
+            lbl = meta.get("label") or "NA"
+            fn = meta.get("filename") or fk.split("/")[-1]
+            is_baf_bait = str(bait).upper() in BAF_SUBUNIT_SET
             bait_tag = " <span style='color:#FF4B4B;'>● BAF</span>" if is_baf_bait else ""
-            df_agg = aggregated_by_file.get(key)
+            df_agg = aggregated_by_file.get(fk)
+            fpath = str(meta.get("path") or os.path.join(data_dir, fk))
 
             with cols[j]:
                 st.markdown(
                     (
                         "<div class='card'>"
                         f"<h4 style='margin:0 0 6px 0;'><b>{bait}</b>{bait_tag}</h4>"
-                        f"<div style='opacity:0.9; margin-bottom:4px;'>Cell Line: {cell}</div>"
-                        f"<div style='opacity:0.9; margin-bottom:8px;'>Replicate: {rep_text}</div>"
-                        f"<div style='font-size:0.9rem; opacity:0.8; word-break:break-word;'>{key}</div>"
+                        f"<div style='opacity:0.9; margin-bottom:4px;'>Investigator: {inv}</div>"
+                        f"<div style='opacity:0.9; margin-bottom:4px;'>Session: {sid}</div>"
+                        f"<div style='opacity:0.9; margin-bottom:8px;'>Label: {lbl}</div>"
+                        f"<div style='font-size:0.9rem; opacity:0.8; word-break:break-word;'>{fn}</div>"
                         "</div>"
                     ),
                     unsafe_allow_html=True,
@@ -570,29 +762,28 @@ def _render_data_vault_tab(
                     )
                     csv_bytes = df_download.to_csv(index=False).encode("utf-8")
                     st.download_button(
-                        "Download CSV",
+                        "Download Aggregated Data",
                         data=csv_bytes,
-                        file_name=_aggregated_download_name(meta, key),
+                        file_name=_aggregated_download_name(meta, fn),
                         mime="text/csv",
-                        key=f"download_{key}",
+                        key=f"download_{fk}",
                     )
                 else:
                     st.caption("Aggregated data unavailable for download.")
 
-                confirm_key = f"confirm_delete_{key}"
-                delete_key = f"delete_{key}"
+                confirm_key = f"confirm_delete_{fk}"
+                delete_key = f"delete_{fk}"
                 st.checkbox("Confirm delete", key=confirm_key)
                 if st.button("Delete", key=delete_key):
                     if st.session_state.get(confirm_key, False):
                         try:
-                            path = os.path.join(data_dir, key)
-                            if os.path.exists(path):
-                                os.remove(path)
+                            if os.path.exists(fpath):
+                                os.remove(fpath)
                             load_portal_data.clear()
-                            st.success(f"Deleted `{key}`.")
+                            st.success(f"Deleted `{fk}`.")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"Delete failed for `{key}`: {e}")
+                            st.error(f"Delete failed for `{fk}`: {e}")
                     else:
                         st.warning("Tick 'Confirm delete' before deleting this file.")
 
@@ -602,8 +793,10 @@ def main() -> None:
     # Inject CSS at app startup so it applies globally.
     _apply_global_css()
 
-    st.title("BAF-Complex IP-MS Analytics Portal")
-    st.caption("Peptide-level CSVs are aggregated to gene-level for PI-friendly interpretation.")
+    st.title("BAF-Vault: IP-MS Encyclopedia")
+    st.caption(
+        "Nested `Data/[Investigator]/` repository with peptide→gene aggregation, SWIFT alias mapping, and lab-scale search."
+    )
 
     matching: list[str] = []
     with st.sidebar:
@@ -612,14 +805,19 @@ def main() -> None:
         if "data_refresh_token" not in st.session_state:
             st.session_state["data_refresh_token"] = 0
         st.markdown("### Data Directory & File Management")
-        st.caption(f"Local data: `{LOCAL_DATA_DIR}`")
+        st.caption(f"Local data: `{LOCAL_DATA_DIR}` (use `Data/[Investigator]/file.csv`)")
 
+        upload_subfolder = st.text_input(
+            "Upload subfolder under Data/",
+            value="Imported",
+            help="Creates `Data/<subfolder>/` and places uploaded CSVs there.",
+        )
         overwrite = st.checkbox("Overwrite existing files on upload", value=False)
         uploaded_files = st.file_uploader(
             "Upload IP-MS CSV files",
             type=["csv"],
             accept_multiple_files=True,
-            help="Upload one or more CSVs. Files are saved to local Data/ for analysis.",
+            help="Upload one or more CSVs. Files are saved under Data/<subfolder>/ for analysis.",
         )
         if uploaded_files:
             try:
@@ -627,6 +825,7 @@ def main() -> None:
                     uploaded_files,
                     LOCAL_DATA_DIR,
                     overwrite=overwrite,
+                    subfolder=str(upload_subfolder or "Imported"),
                 )
                 st.success(
                     f"Upload complete: saved {counts['saved']} file(s), skipped {counts['skipped']} existing file(s)."
@@ -657,7 +856,7 @@ def main() -> None:
         if skipped_files:
             st.caption(f"Skipped {len(skipped_files)} file(s) due to parsing issues.")
 
-        dataset_keys_all = experiments_df["filename"].tolist()
+        dataset_keys_all = experiments_df["file_key"].astype(str).tolist()
         meta_lookup = meta_by_file
         labels = {k: _pretty_dataset_label(k, meta_lookup.get(k, {})) for k in dataset_keys_all}
 
@@ -697,6 +896,36 @@ def main() -> None:
             options=dataset_keys_for_picker,
             format_func=lambda k: labels.get(k, k),
             key="portal_dataset_select",
+        )
+
+        st.markdown("#### Browse by Investigator")
+        by_inv: dict[str, list[str]] = defaultdict(list)
+        for fk in dataset_keys_all:
+            inv = str(meta_lookup.get(fk, {}).get("investigator") or "N/A")
+            by_inv[inv].append(fk)
+        for inv in sorted(by_inv.keys(), key=lambda s: (s == "N/A", s.lower())):
+            safe = str(inv).replace("/", "_").replace(" ", "_")[:48]
+            with st.expander(f"{inv} ({len(by_inv[inv])})"):
+                pick = st.selectbox(
+                    "Experiments",
+                    options=sorted(by_inv[inv]),
+                    key=f"inv_pick_{safe}",
+                    format_func=lambda kk: labels.get(kk, kk),
+                )
+                if st.button("Set as active dataset", key=f"inv_set_{safe}", type="primary"):
+                    st.session_state["portal_dataset_select"] = pick
+                    st.session_state["portal_project_view"] = "All Experiments"
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("### Multi-Compare (2–4)")
+        st.multiselect(
+            "Experiments for scatter matrix",
+            options=dataset_keys_all,
+            format_func=lambda kk: labels.get(kk, kk),
+            key="multi_compare_pick",
+            max_selections=4,
+            help="Select 2–4 runs, then open the **Multi-Experiment Compare** tab.",
         )
 
         st.markdown("---")
@@ -740,13 +969,14 @@ def main() -> None:
 
     df_gene = aggregated_by_file[selected_dataset]
 
-    # Tabs: Main, Comparison, Data Vault, and Global Search.
-    tab_main, tab_cmp, tab_vault, tab_global = st.tabs(
+    tab_main, tab_cmp, tab_vault, tab_global, tab_batch, tab_multi = st.tabs(
         [
             "Main Dashboard",
             "Comparison Mode",
-            "Data Vault: Experiment Directory",
+            "Data Vault",
             "Global Search",
+            "Batch Subunit (Consensus)",
+            "Multi-Experiment Compare",
         ]
     )
 
@@ -778,21 +1008,36 @@ def main() -> None:
             kind="mergesort",
         )
 
-        df_table = df_view[
-            [
-                "Gene Symbol",
-                "Spectral Count",
-                "Unique Peptides",
-                "Confidence Score",
-                "Log_Prob",
-                "is_baf_core",
-            ]
+        base_cols = [
+            "Gene Symbol",
+            "Biological Target",
+            "Domain/Details",
+            "Spectral Count",
+            "Unique Peptides",
+            "Confidence Score",
+            "Log_Prob",
+            "is_baf_core",
         ]
-        # Keep it compact but PI-friendly.
+        use_cols = [c for c in base_cols if c in df_view.columns]
+        df_table = df_view[use_cols].copy()
         df_table = df_table.rename(columns={"Log_Prob": "-log10(avg Prob)"})
 
         styler = _styled_gene_table(df_table)
         st.dataframe(styler, use_container_width=True, height=520)
+
+        meta_cur = meta_by_file.get(selected_dataset, {})
+        dl = df_view.sort_values(
+            by=["is_baf_core", "Spectral Count", "Confidence Score"],
+            ascending=[False, False, False],
+            kind="mergesort",
+        )
+        st.download_button(
+            "Download Aggregated Data",
+            data=dl.to_csv(index=False).encode("utf-8"),
+            file_name=_aggregated_download_name(meta_cur, str(meta_cur.get("filename") or selected_dataset)),
+            mime="text/csv",
+            key="download_main_active",
+        )
 
     with tab_cmp:
         st.markdown("### Dataset Comparison (Overlap vs Unique Interactors)")
@@ -881,6 +1126,55 @@ def main() -> None:
             aggregated_by_file=aggregated_by_file,
             meta_by_file=meta_by_file,
         )
+
+    with tab_batch:
+        st.markdown("### Batch Subunit Analysis (Lab Consensus)")
+        st.caption("Aggregate every experiment where the inferred bait matches your selection (>50% prevalence).")
+
+        baits = sorted(
+            {
+                str(x).strip()
+                for x in experiments_df["bait"].dropna().tolist()
+                if str(x).strip() not in ("", "N/A", "nan")
+            }
+        )
+        manual = st.text_input("Type a bait if missing from list", value="", key="batch_bait_manual")
+        options = sorted(set(baits + ([manual.strip()] if manual.strip() else [])))
+
+        if not options:
+            st.info("No bait options yet. Run imports or enter a bait name above.")
+        else:
+            pick = st.selectbox("Bait / target", options=options, key="batch_bait_select")
+            runs = [fk for fk in dataset_keys_all if _meta_matches_bait(meta_by_file.get(fk, {}), pick)]
+            st.metric("Matching experiments", len(runs))
+            if not runs:
+                st.warning("No experiments matched this bait (check filenames/labels).")
+            else:
+                cons = _lab_consensus_table(runs, aggregated_by_file, min_fraction=0.5)
+                if cons.empty:
+                    st.info("No proteins exceeded 50% prevalence across these runs.")
+                else:
+                    st.dataframe(cons, use_container_width=True, height=520)
+                    st.download_button(
+                        "Download Consensus Table",
+                        data=cons.to_csv(index=False).encode("utf-8"),
+                        file_name=f"Consensus_{str(pick).replace('/', '_')}_50pct.csv",
+                        mime="text/csv",
+                        key="download_consensus_batch",
+                    )
+
+    with tab_multi:
+        st.markdown("### Multi-Experiment Comparison (Scatter Matrix)")
+        sel = [str(x) for x in st.session_state.get("multi_compare_pick", [])]
+        if len(sel) < 2:
+            st.info("In the sidebar, select **2–4 experiments** under **Multi-Compare**.")
+        elif len(sel) > 4:
+            st.warning("Please choose at most 4 experiments in the sidebar.")
+        else:
+            st.plotly_chart(
+                _scatter_matrix_spectral(sel, aggregated_by_file, meta_by_file),
+                use_container_width=True,
+            )
 
 
 if __name__ == "__main__":
