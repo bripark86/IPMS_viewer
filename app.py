@@ -40,6 +40,11 @@ CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
 VOLCANO_CONFIDENCE_P_CUTOFF = 0.05
 # Subtle prey points (non-BAF); BAF uses BAF_CORE_COLOR (#FF4B4B).
 VOLCANO_PREY_COLOR = "#5C6E82"
+# Publication volcano (FC vs −log10 p)
+VOLCANO_PUB_GREY = "#9E9E9E"
+VOLCANO_PUB_RED = "#D62728"
+VOLCANO_PUB_BLUE = "#1F78B4"
+VOLCANO_PUB_BAIT = "#FDB462"
 
 
 def _apply_global_css() -> None:
@@ -305,6 +310,251 @@ def _infer_bait_gene_for_volcano(meta: dict[str, Any]) -> str | None:
 def _short_dataset_label(file_key: str, meta: dict[str, Any], *, max_len: int = 32) -> str:
     fn = str(meta.get("filename") or file_key.split("/")[-1])
     return (fn[: max_len - 1] + "…") if len(fn) > max_len else fn
+
+
+def _investigator_folder_from_file_key(file_key: str) -> str | None:
+    norm = str(file_key).replace("\\", "/").strip("/")
+    if "/" not in norm:
+        return None
+    return norm.split("/")[0]
+
+
+def _meta_suggests_mock_or_ev(meta: dict[str, Any]) -> bool:
+    """True if filename/label/bait indicates Mock IP or empty-vector (EV) control."""
+    blob = " ".join(
+        [
+            str(meta.get("label") or ""),
+            str(meta.get("filename") or ""),
+            str(meta.get("bait") or ""),
+            str(meta.get("biological_target") or ""),
+        ]
+    ).upper()
+    blob = blob.replace("-", "_")
+    if re.search(r"\bMOCK\b", blob):
+        return True
+    if re.search(r"\bEV\b", blob):
+        return True
+    if "EMPTY" in blob and "VECTOR" in blob:
+        return True
+    if "EMPTY_VECTOR" in blob or "NEGATIVE" in blob:
+        return True
+    return False
+
+
+def _auto_control_dataset_key(
+    active_key: str,
+    all_keys: list[str],
+    meta_by_file: dict[str, dict[str, Any]],
+) -> str | None:
+    """Pick a Mock/EV CSV in the same investigator subfolder as the active run (if any)."""
+    inv_active = _investigator_folder_from_file_key(active_key)
+    if not inv_active:
+        return None
+    candidates: list[str] = []
+    for k in all_keys:
+        if k == active_key:
+            continue
+        if _investigator_folder_from_file_key(k) != inv_active:
+            continue
+        if _meta_suggests_mock_or_ev(meta_by_file.get(k, {})):
+            candidates.append(k)
+    return sorted(candidates)[0] if candidates else None
+
+
+def _prepare_volcano_foldchange_frame(
+    df_bait: pd.DataFrame,
+    df_control: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Gene-level log2 fold change with +1 pseudocount:
+    log2((bait_sc+1)/(control_sc+1)), or vs dataset mean spectral count if no control.
+    """
+    d = df_bait.copy()
+    d["Gene Symbol"] = d["Gene Symbol"].astype(str).str.strip().str.upper()
+    sc_b = pd.to_numeric(d["Spectral Count"], errors="coerce").fillna(0.0)
+    if df_control is not None and not df_control.empty:
+        c = df_control.copy()
+        c["Gene Symbol"] = c["Gene Symbol"].astype(str).str.strip().str.upper()
+        idx = pd.to_numeric(c.groupby("Gene Symbol", sort=False)["Spectral Count"].sum(), errors="coerce").fillna(0.0)
+        sc_m = d["Gene Symbol"].map(idx).fillna(0.0).astype(float)
+        mode = "mock_ev"
+    else:
+        mu = float(sc_b.mean()) if len(sc_b) else 0.0
+        sc_m = pd.Series(np.full(len(d), mu, dtype=float), index=d.index)
+        mode = "mean_baseline"
+    d["Log2FC"] = np.log2((sc_b.astype(float) + 1.0) / (sc_m + 1.0))
+    d["Log_Prob"] = pd.to_numeric(d["Log_Prob"], errors="coerce")
+    d = d.dropna(subset=["Log_Prob"])
+    return d, mode
+
+
+def _make_publication_volcano_figure(
+    df: pd.DataFrame,
+    *,
+    bait_gene: str | None,
+    log2_fc_threshold: float,
+    neg_log10_p_threshold: float,
+    n_top_labels: int,
+) -> go.Figure:
+    """Fold-change volcano: white background, quadrant colors, cutoffs, top-hit labels."""
+    if df.empty:
+        fig = go.Figure()
+        fig.update_layout(template="plotly_white", title="No genes with valid LDA probability")
+        return fig
+
+    d = df.copy()
+    d["Log_Prob_plot"] = _log_prob_y_with_jitter(d["Log_Prob"], d["Gene Symbol"])
+
+    fc_t = float(log2_fc_threshold)
+    y_t = float(neg_log10_p_threshold)
+
+    d["quad"] = "ns"
+    d.loc[(d["Log2FC"] >= fc_t) & (d["Log_Prob"] >= y_t), "quad"] = "up"
+    d.loc[(d["Log2FC"] <= -fc_t) & (d["Log_Prob"] >= y_t), "quad"] = "down"
+
+    genes_u = d["Gene Symbol"].astype(str).str.strip().str.upper()
+    bait_u = bait_gene.strip().upper() if bait_gene else None
+    is_bait = genes_u == bait_u if bait_u else pd.Series(False, index=d.index)
+
+    if "Unique Peptides" not in d.columns:
+        d["Unique Peptides"] = 0
+
+    d_bg = d.loc[(d["quad"] == "ns") & ~is_bait].copy()
+    d_up = d.loc[(d["quad"] == "up") & ~is_bait].copy()
+    d_dn = d.loc[(d["quad"] == "down") & ~is_bait].copy()
+    d_bait_only = d.loc[is_bait].copy()
+
+    fig = go.Figure()
+
+    def _trace(sub: pd.DataFrame, *, name: str, color: str, size: int) -> None:
+        if sub.empty:
+            return
+        fig.add_trace(
+            go.Scatter(
+                x=sub["Log2FC"],
+                y=sub["Log_Prob_plot"],
+                mode="markers",
+                name=name,
+                marker=dict(size=size, color=color, opacity=0.85, line=dict(width=0.35, color="rgba(0,0,0,0.25)")),
+                customdata=np.stack(
+                    [
+                        sub["Gene Symbol"].astype(str).values,
+                        sub["Spectral Count"].values,
+                        sub["Unique Peptides"].values,
+                        sub["Log2FC"].values,
+                        sub["Log_Prob"].values,
+                    ],
+                    axis=-1,
+                ),
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "Log2 FC: %{customdata[3]:.3f}<br>"
+                    "Spectral count: %{customdata[1]}<br>"
+                    "Unique peptides: %{customdata[2]}<br>"
+                    "−log10 LDA p: %{customdata[4]:.4f}<br>"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    _trace(d_bg, name="Non-significant", color=VOLCANO_PUB_GREY, size=5)
+    _trace(d_dn, name="Depleted", color=VOLCANO_PUB_BLUE, size=7)
+    _trace(d_up, name="Enriched", color=VOLCANO_PUB_RED, size=7)
+
+    if bait_u and not d_bait_only.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=d_bait_only["Log2FC"],
+                y=d_bait_only["Log_Prob_plot"],
+                mode="markers",
+                name=f"Bait ({bait_u})",
+                marker=dict(
+                    size=16,
+                    color=VOLCANO_PUB_BAIT,
+                    symbol="diamond",
+                    line=dict(width=1, color="#333333"),
+                ),
+                customdata=np.stack(
+                    [
+                        d_bait_only["Gene Symbol"].astype(str).values,
+                        d_bait_only["Spectral Count"].values,
+                        d_bait_only["Unique Peptides"].values,
+                        d_bait_only["Log2FC"].values,
+                        d_bait_only["Log_Prob"].values,
+                    ],
+                    axis=-1,
+                ),
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b> (bait)<br>"
+                    "Log2 FC: %{customdata[3]:.3f}<br>"
+                    "Spectral count: %{customdata[1]}<br>"
+                    "Unique peptides: %{customdata[2]}<br>"
+                    "−log10 LDA p: %{customdata[4]:.4f}<br>"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    abs_fc = np.abs(d["Log2FC"].astype(float).to_numpy())
+    xmax_raw = float(np.nanmax(abs_fc)) if np.isfinite(abs_fc).any() else 1.0
+    xmax = max(3.0, xmax_raw * 1.15 + 0.5)
+    y_max = max(0.5, float(d["Log_Prob_plot"].max()) * 1.12)
+
+    fig.add_vline(x=fc_t, line_dash="dash", line_color="#757575", line_width=1)
+    fig.add_vline(x=-fc_t, line_dash="dash", line_color="#757575", line_width=1)
+    fig.add_hline(y=y_t, line_dash="dash", line_color="#757575", line_width=1)
+
+    ann: list[dict[str, Any]] = []
+    top_enr = (
+        d.loc[(d["quad"] == "up")]
+        .sort_values(["Log_Prob", "Log2FC"], ascending=[False, False])
+        .head(max(5, min(int(n_top_labels), 15)))
+    )
+    for _, row in top_enr.iterrows():
+        ann.append(
+            dict(
+                x=float(row["Log2FC"]),
+                y=float(row["Log_Prob_plot"]),
+                text=str(row["Gene Symbol"]),
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=0.55,
+                arrowwidth=0.8,
+                arrowcolor="#404040",
+                ax=0,
+                ay=-36,
+                font=dict(size=10, color="#222222"),
+                bgcolor="rgba(255,255,255,0.92)",
+                bordercolor="rgba(0,0,0,0.12)",
+                borderwidth=1,
+                borderpad=3,
+            )
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FAFAFA",
+        font=dict(color="#222222", size=11),
+        margin=dict(l=56, r=36, t=40, b=48),
+        xaxis=dict(
+            title=dict(text="Log<sub>2</sub> fold change (bait / baseline)", font=dict(size=13)),
+            range=[-xmax, xmax],
+            gridcolor="#E0E0E0",
+            zeroline=True,
+            zerolinecolor="#BDBDBD",
+            zerolinewidth=1,
+        ),
+        yaxis=dict(
+            title=dict(text="Significance (−log<sub>10</sub> LDA probability)", font=dict(size=13)),
+            range=[0, y_max],
+            gridcolor="#E0E0E0",
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        annotations=ann,
+        height=520,
+    )
+    return fig
 
 
 def _log_prob_y_with_jitter(log_prob: pd.Series, gene_symbols: pd.Series) -> np.ndarray:
@@ -638,14 +888,20 @@ def draw_volcano_plot(
     active_dataset: pd.DataFrame,
     *,
     bait_gene: str | None,
-    confidence_p_threshold: float | None = VOLCANO_CONFIDENCE_P_CUTOFF,
+    df_baseline: pd.DataFrame | None,
+    log2_fc_threshold: float,
+    neg_log10_p_threshold: float,
+    n_top_labels: int,
 ) -> go.Figure:
-    """Not cached: must redraw when `active_dataset_id` or frame changes (cache caused stale plots)."""
+    """Publication-style FC volcano; baseline is Mock/EV (same folder) or mean spectral count."""
     _ = active_dataset_id
-    return _make_volcano_figure(
-        active_dataset,
+    df_fc, _mode = _prepare_volcano_foldchange_frame(active_dataset, df_baseline)
+    return _make_publication_volcano_figure(
+        df_fc,
         bait_gene=bait_gene,
-        confidence_p_threshold=confidence_p_threshold,
+        log2_fc_threshold=log2_fc_threshold,
+        neg_log10_p_threshold=neg_log10_p_threshold,
+        n_top_labels=n_top_labels,
     )
 
 
@@ -1491,6 +1747,35 @@ def main() -> None:
                     st.rerun()
 
         st.markdown("---")
+        st.markdown("### Volcano plot (FC × significance)")
+        st.slider(
+            "Log2 |fold change| cutoff",
+            min_value=0.25,
+            max_value=3.0,
+            value=1.5,
+            step=0.05,
+            key="volcano_fc_threshold",
+            help="Dashed vertical lines at ±this Log2 fold change; quadrant coloring uses the same threshold.",
+        )
+        st.slider(
+            "−log10(LDA p) cutoff",
+            min_value=0.5,
+            max_value=15.0,
+            value=2.0,
+            step=0.05,
+            key="volcano_neglog10_p",
+            help="Dashed horizontal line (e.g. 2.0 ≈ p < 0.01 on average LDA probability).",
+        )
+        st.slider(
+            "Label top N enriched genes",
+            min_value=5,
+            max_value=15,
+            value=8,
+            step=1,
+            key="volcano_n_labels",
+        )
+
+        st.markdown("---")
         st.markdown("### Comparative Analytics")
         st.multiselect(
             "Experiments to compare (select ≥2)",
@@ -1586,15 +1871,36 @@ def main() -> None:
         c2.metric("BAF Subunits Found", f"{baf_detected}")
         c3.metric("Top Interactor", top_interactor if top_interactor else "NA")
 
-        st.markdown("### Volcano Plot")
+        st.markdown("### Volcano Plot (publication style)")
+        control_key = _auto_control_dataset_key(selected_dataset, dataset_keys_all, meta_by_file)
+        df_volc_baseline = aggregated_by_file.get(control_key) if control_key else None
+        if control_key:
+            st.caption(
+                f"**Baseline:** Mock/EV control in the same folder — `{labels.get(control_key, control_key)}`. "
+                "Log2 fold change uses **(spectral count + 1)** in bait vs control."
+            )
+        else:
+            st.caption(
+                "**Baseline:** mean spectral count in this IP (no Mock/EV CSV detected in the same investigator folder). "
+                "X-axis is **relative** log2 enrichment vs that mean (+1 pseudocount)."
+            )
+
+        vol_fc_thr = float(st.session_state.get("volcano_fc_threshold", 1.5))
+        vol_y_thr = float(st.session_state.get("volcano_neglog10_p", 2.0))
+        vol_n_lbl = int(st.session_state.get("volcano_n_labels", 8))
+
         st.plotly_chart(
             draw_volcano_plot(
                 selected_dataset,
                 active_df,
                 bait_gene=bait_gene_for_volcano,
+                df_baseline=df_volc_baseline,
+                log2_fc_threshold=vol_fc_thr,
+                neg_log10_p_threshold=vol_y_thr,
+                n_top_labels=vol_n_lbl,
             ),
             use_container_width=True,
-            key=f"main_volcano_{selected_dataset}",
+            key=f"main_volcano_{selected_dataset}_{vol_fc_thr}_{vol_y_thr}_{vol_n_lbl}",
         )
 
         st.markdown("### Complex Coverage (BAF Subunits Pulled Down)")
