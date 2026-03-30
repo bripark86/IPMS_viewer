@@ -4,7 +4,7 @@ import argparse
 import os
 import shutil
 
-LOCAL_DATA_DIR = os.path.join(os.path.dirname(__file__), "Data")
+LOCAL_DATA_DIR = os.path.abspath(os.path.normpath(os.path.join(os.getcwd(), "Data")))
 DATA_SOURCE_DIR_DEFAULT = "/Users/sp1665/Downloads/IPMS/Janet_Liu"
 
 

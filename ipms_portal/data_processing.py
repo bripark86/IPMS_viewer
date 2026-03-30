@@ -179,17 +179,22 @@ def scan_csv_files(data_dir: str) -> list[ExperimentMeta]:
     Recursively scan Data/[Investigator]/... for CSVs.
     Sorted newest -> oldest by mtime.
     """
+    data_root = os.path.abspath(os.path.normpath(data_dir))
+    print(f"[IPMS Debug] scan_csv_files: os.walk starting at {data_root!r}")
+    print(f"[IPMS Debug] scan_csv_files: os.getcwd() = {os.getcwd()!r}")
+
     metas: list[ExperimentMeta] = []
-    if not os.path.isdir(data_dir):
+    if not os.path.isdir(data_root):
+        print(f"[IPMS Debug] scan_csv_files: not a directory or missing: {data_root!r}")
         return metas
 
-    for root, _dirs, files in os.walk(data_dir):
+    for root, _dirs, files in os.walk(data_root):
         for name in files:
             if not name.lower().endswith(".csv"):
                 continue
             path = os.path.join(root, name)
             try:
-                rel = os.path.relpath(path, data_dir)
+                rel = os.path.relpath(path, data_root)
             except ValueError:
                 continue
             rel_posix = rel.replace(os.sep, "/")
@@ -215,6 +220,7 @@ def scan_csv_files(data_dir: str) -> list[ExperimentMeta]:
             )
 
     metas.sort(key=lambda m: m.mtime, reverse=True)
+    print(f"[IPMS Debug] scan_csv_files: discovered {len(metas)} CSV(s) (incl. nested e.g. Data/Janet_Liu/*.csv)")
     return metas
 
 

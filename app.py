@@ -21,8 +21,15 @@ from ipms_portal.data_processing import (
 
 DATA_SOURCE_DIR_DEFAULT = "/Users/sp1665/Downloads/IPMS/Janet_Liu"
 PROJECT_ROOT = os.path.dirname(__file__)
-LOCAL_DATA_DIR = os.path.join(PROJECT_ROOT, "Data")
 DATA_EMPTY_MESSAGE = "No datasets found in /Data. Please add IP-MS CSVs to begin analysis."
+
+
+def get_local_data_dir() -> str:
+    """
+    Resolve ./Data relative to the process working directory.
+    Streamlit Cloud runs with cwd at the repo root, so this matches Data/ in the repository.
+    """
+    return os.path.abspath(os.path.normpath(os.path.join(os.getcwd(), "Data")))
 CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
 
 
@@ -49,8 +56,8 @@ def _apply_global_css() -> None:
     )
 
 
-def _ensure_local_data_dir() -> None:
-    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+def _ensure_local_data_dir(data_dir: str) -> None:
+    os.makedirs(data_dir, exist_ok=True)
 
 
 def _count_csv_files(data_dir: str) -> int:
@@ -280,7 +287,9 @@ def load_portal_data(
     - meta_by_file: mapping file_key -> dict meta fields (for UI labeling)
     """
     _ = refresh_token  # included to force cache invalidation on refresh
-    metas = scan_csv_files(data_dir)
+    data_root = os.path.abspath(os.path.normpath(data_dir))
+    print(f"[IPMS Debug] load_portal_data: scanning repository Data at {data_root!r} (refresh_token={refresh_token})")
+    metas = scan_csv_files(data_root)
     experiments_rows: list[dict[str, Any]] = []
     aggregated_by_file: dict[str, pd.DataFrame] = {}
     meta_by_file: dict[str, dict[str, Any]] = {}
@@ -793,6 +802,10 @@ def main() -> None:
     # Inject CSS at app startup so it applies globally.
     _apply_global_css()
 
+    data_dir = get_local_data_dir()
+    print(f"[IPMS Debug] App using Data root (./Data via cwd): {data_dir!r}")
+    print(f"[IPMS Debug] os.getcwd(): {os.getcwd()!r}")
+
     st.title("BAF-Vault: IP-MS Encyclopedia")
     st.caption(
         "Nested `Data/[Investigator]/` repository with peptide→gene aggregation, SWIFT alias mapping, and lab-scale search."
@@ -800,12 +813,12 @@ def main() -> None:
 
     matching: list[str] = []
     with st.sidebar:
-        _ensure_local_data_dir()
+        _ensure_local_data_dir(data_dir)
 
         if "data_refresh_token" not in st.session_state:
             st.session_state["data_refresh_token"] = 0
         st.markdown("### Data Directory & File Management")
-        st.caption(f"Local data: `{LOCAL_DATA_DIR}` (use `Data/[Investigator]/file.csv`)")
+        st.caption(f"Local data: `{data_dir}` (use `Data/[Investigator]/file.csv`; cwd-relative `./Data`)")
 
         upload_subfolder = st.text_input(
             "Upload subfolder under Data/",
@@ -823,7 +836,7 @@ def main() -> None:
             try:
                 counts = save_uploaded_csvs_to_local_data(
                     uploaded_files,
-                    LOCAL_DATA_DIR,
+                    data_dir,
                     overwrite=overwrite,
                     subfolder=str(upload_subfolder or "Imported"),
                 )
@@ -837,7 +850,7 @@ def main() -> None:
             st.session_state["data_refresh_token"] += 1
             load_portal_data.clear()
 
-        local_csv_count = _count_csv_files(LOCAL_DATA_DIR)
+        local_csv_count = _count_csv_files(data_dir)
         if local_csv_count == 0:
             st.info(DATA_EMPTY_MESSAGE)
             st.stop()
@@ -845,7 +858,7 @@ def main() -> None:
         st.markdown("---")
         st.markdown("### Dataset Browser")
         experiments_df, aggregated_by_file, meta_by_file, skipped_files = load_portal_data(
-            LOCAL_DATA_DIR,
+            data_dir,
             st.session_state["data_refresh_token"],
         )
 
@@ -1117,7 +1130,7 @@ def main() -> None:
             experiments_df=experiments_df,
             aggregated_by_file=aggregated_by_file,
             meta_by_file=meta_by_file,
-            data_dir=LOCAL_DATA_DIR,
+            data_dir=data_dir,
         )
 
     with tab_global:
