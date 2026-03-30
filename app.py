@@ -33,6 +33,8 @@ DATA_ROOT = pathlib.Path(__file__).parent.resolve() / "Data"
 # set this before the main selectbox runs, then pop and apply.
 _PENDING_PORTAL_DATASET_KEY = "_pending_portal_dataset"
 ACTIVE_DATASET_STATE_KEY = "active_dataset_id"
+ACTIVE_DF_STATE_KEY = "active_df"
+_DATASET_SWITCH_RERUN_KEY = "_dataset_switch_rerun"
 CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
 
 
@@ -454,6 +456,9 @@ def _make_volcano_figure(
     yaxis_cfg: dict[str, Any] = dict(gridcolor="rgba(255,255,255,0.08)", title="-log10(LDA Probability)")
     if yaxis_range is not None:
         yaxis_cfg["range"] = [float(yaxis_range[0]), float(yaxis_range[1])]
+    else:
+        y_max = float(df["Log_Prob_plot"].max())
+        yaxis_cfg["range"] = [0.0, max(y_max * 1.1, 0.05)]
 
     fig.update_layout(
         template="plotly_dark",
@@ -600,16 +605,20 @@ def _correlation_heatmap_spectral(
     return fig
 
 
-@st.cache_data(show_spinner=False)
 def draw_volcano_plot(
     active_dataset_id: str, active_dataset: pd.DataFrame, *, bait_gene: str | None
 ) -> go.Figure:
+    """Not cached: must redraw when `active_dataset_id` or frame changes (cache caused stale plots)."""
+    _ = active_dataset_id
     return _make_volcano_figure(active_dataset, bait_gene=bait_gene)
 
 
-@st.cache_data(show_spinner=False)
 def draw_complex_coverage(active_dataset_id: str, active_dataset: pd.DataFrame) -> go.Figure:
-    """All BAF_SUBUNITS on Y-axis; missing subunits show 0 (gaps visible). Order = canonical list."""
+    """
+    Recomputes BAF subunit coverage from `active_dataset` on every call (no cache).
+    All BAF_SUBUNITS on Y-axis; missing subunits show 0. Order = canonical list.
+    """
+    _ = active_dataset_id
     gs_u = active_dataset["Gene Symbol"].astype(str).str.strip().str.upper()
     sc = pd.to_numeric(active_dataset["Spectral Count"], errors="coerce").fillna(0.0)
     counts = pd.DataFrame({"_g": gs_u, "_s": sc}).groupby("_g", sort=False)["_s"].sum()
@@ -1385,6 +1394,7 @@ def main() -> None:
             if pending_fk and str(pending_fk) in dataset_keys_all:
                 st.session_state["portal_project_view"] = "All Experiments"
                 st.session_state["portal_dataset_select"] = str(pending_fk)
+                st.session_state[_DATASET_SWITCH_RERUN_KEY] = True
             elif pending_fk:
                 st.warning(f"Could not switch active dataset (not in library): {pending_fk!r}")
 
@@ -1487,6 +1497,9 @@ def main() -> None:
                 key="subunit_jump_dataset",
             )
 
+    if st.session_state.pop(_DATASET_SWITCH_RERUN_KEY, False):
+        st.rerun()
+
     # Subunit jump overrides the main dataset picker when matches exist.
     if matching:
         selected_dataset = str(st.session_state.get("subunit_jump_dataset", dataset_keys_all[0]))
@@ -1504,11 +1517,15 @@ def main() -> None:
         st.error(f"Failed to load data for the selected experiment. Details: {e}")
         st.stop()
 
-    prev_active = st.session_state.get(ACTIVE_DATASET_STATE_KEY)
-    if prev_active is not None and prev_active != selected_dataset:
-        draw_volcano_plot.clear()
-        draw_complex_coverage.clear()
+    prev_dataset_id = st.session_state.get(ACTIVE_DATASET_STATE_KEY)
+    if prev_dataset_id is not None and prev_dataset_id != selected_dataset:
+        st.toast(
+            f"Loading dataset: {labels.get(selected_dataset, selected_dataset)}…",
+            icon="📊",
+        )
     st.session_state[ACTIVE_DATASET_STATE_KEY] = selected_dataset
+    st.session_state[ACTIVE_DF_STATE_KEY] = df_gene.copy()
+    active_df: pd.DataFrame = st.session_state[ACTIVE_DF_STATE_KEY]
 
     bait_gene_for_volcano = _infer_bait_gene_for_volcano(meta_by_file.get(selected_dataset, {}))
 
@@ -1537,7 +1554,7 @@ def main() -> None:
         st.plotly_chart(
             draw_volcano_plot(
                 selected_dataset,
-                df_gene,
+                active_df,
                 bait_gene=bait_gene_for_volcano,
             ),
             use_container_width=True,
@@ -1546,13 +1563,13 @@ def main() -> None:
 
         st.markdown("### Complex Coverage (BAF Subunits Pulled Down)")
         st.plotly_chart(
-            draw_complex_coverage(selected_dataset, df_gene),
+            draw_complex_coverage(selected_dataset, active_df),
             use_container_width=True,
             key=f"main_coverage_{selected_dataset}",
         )
 
         st.markdown("### Gene-Level Aggregated Table")
-        df_view = df_gene.copy()
+        df_view = active_df.copy()
         df_view["Confidence Score"] = pd.to_numeric(df_view["Confidence Score"], errors="coerce")
         df_view["Spectral Count"] = pd.to_numeric(df_view["Spectral Count"], errors="coerce")
         # Default table order: strongest spectral signal first (stable ties).

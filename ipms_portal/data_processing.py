@@ -119,24 +119,24 @@ def _select_and_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df2
 
 
-def _coerce_lda_probability_series(s: pd.Series) -> pd.Series:
+def _peptide_lda_prob_column(df: pd.DataFrame) -> pd.Series:
     """
-    Force numeric LDA probability; map placeholders to NaN. Valid range for aggregation: (0, 1].
-    Values in (1, 100] are treated as percents and scaled.
+    Numeric LDA probability per peptide row: non-numeric / empty -> 1.0 (uninformative prior).
+    Values in (1, 100] treated as percents. Clipped to (0, 1].
     """
-    s2 = s.astype(str).str.strip() if s.dtype == object or str(s.dtype) == "string" else s
-    if s.dtype == object or str(s.dtype) == "string":
-        u = s2.str.upper()
-        bad = u.isin(["", "N/A", "NA", "NAN", "NONE", "NULL", "-", "—"]) | u.str.match(r"^N/?A$", na=False)
-        s2 = s2.where(~bad, np.nan)
-        num = pd.to_numeric(s2, errors="coerce")
-    else:
-        num = pd.to_numeric(s, errors="coerce")
-    num = num.astype(float)
-    pct = num.notna() & (num > 1.0) & (num <= 100.0)
-    num = num.where(~pct, num / 100.0)
-    num = num.where(num.notna() & (num > 0.0) & (num <= 1.0), np.nan)
-    return num
+    if "LDA Probability" not in df.columns:
+        return pd.Series(1.0, index=df.index, dtype=float)
+
+    s = df["LDA Probability"].astype(str).str.strip()
+    u = s.str.upper()
+    bad = u.isin(["", "N/A", "NA", "NAN", "NONE", "NULL", "-", "—"])
+    s = s.where(~bad, np.nan)
+    lda = pd.to_numeric(s, errors="coerce").fillna(1.0).astype(float)
+    pct = (lda > 1.0) & (lda <= 100.0)
+    lda = lda.where(~pct, lda / 100.0)
+    lda = lda.where(lda <= 1.0, 1.0)
+    lda = lda.clip(lower=1e-15, upper=1.0)
+    return lda
 
 
 def load_and_aggregate_csv(path: str) -> pd.DataFrame:
@@ -158,22 +158,17 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
     df["Gene Symbol"] = df["Gene Symbol"].astype(str).str.strip()
     df["Peptide"] = df["Peptide"].astype(str).str.strip()
 
-    if "LDA Probability" in df.columns:
-        df["LDA Probability"] = _coerce_lda_probability_series(df["LDA Probability"])
-    else:
-        df["LDA Probability"] = np.nan
+    df["LDA_Prob"] = _peptide_lda_prob_column(df)
 
     grouped = df.groupby("Gene Symbol", dropna=False, sort=False)
     spectral_count = grouped.size().rename("Spectral Count")
     unique_peptides = grouped["Peptide"].nunique(dropna=True).rename("Unique Peptides")
-    avg_lda = grouped["LDA Probability"].mean().rename("Confidence Score")
+    avg_lda = grouped["LDA_Prob"].mean().rename("Confidence Score")
 
     out = pd.concat([spectral_count, unique_peptides, avg_lda], axis=1).reset_index()
-    cs = pd.to_numeric(out["Confidence Score"], errors="coerce")
+    cs = pd.to_numeric(out["Confidence Score"], errors="coerce").fillna(1.0).clip(lower=1e-15, upper=1.0)
     out["Confidence Score"] = cs
-    valid_prob = cs.notna() & (cs > 0.0) & (cs <= 1.0)
-    out["Log_Prob"] = np.nan
-    out.loc[valid_prob, "Log_Prob"] = -np.log10(cs.loc[valid_prob])
+    out["Log_Prob"] = -np.log10(cs)
 
     return out
 
