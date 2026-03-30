@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -663,6 +664,51 @@ def _aggregated_download_name(meta: dict[str, Any], fallback_filename: str) -> s
     return f"{bait}_{cell}_Aggregated.csv"
 
 
+def _vault_resolve_target_from_meta(meta: dict[str, Any]) -> str:
+    """Prefer biological target, then inferred bait; fall back to sample label."""
+    bt = str(meta.get("biological_target") or "").strip()
+    if bt and bt.upper() not in ("N/A", "NA", ""):
+        return bt
+    bait = str(meta.get("bait") or "").strip()
+    if bait and bait.upper() not in ("N/A", "NA", ""):
+        return bait
+    lbl = str(meta.get("label") or "").strip()
+    return lbl if lbl else "—"
+
+
+def _vault_target_display_is_baf(target_display: str) -> bool:
+    toks = re.split(r"[^A-Z0-9]+", str(target_display).upper())
+    return any(t in BAF_SUBUNIT_SET for t in toks if t)
+
+
+def _style_vault_experiment_table(df: pd.DataFrame) -> Any:
+    """Highlight BAF-related targets in the Target column."""
+
+    def highlight_row(row: pd.Series) -> list[str]:
+        styles = [""] * len(row)
+        if "Target" not in row.index:
+            return styles
+        pos = row.index.get_loc("Target")
+        if isinstance(pos, (np.ndarray, slice)):
+            return styles
+        if _vault_target_display_is_baf(str(row["Target"])):
+            styles[int(pos)] = (
+                f"background-color: {BAF_CORE_COLOR}; color: #FFFFFF; font-weight: 600;"
+            )
+        return styles
+
+    return df.style.apply(highlight_row, axis=1)
+
+
+def _vault_action_label(fk: str, meta_by_file: dict[str, dict[str, Any]]) -> str:
+    m = meta_by_file.get(fk, {})
+    inv = m.get("investigator") or "—"
+    sid = m.get("session_id") or "—"
+    tgt = _vault_resolve_target_from_meta(m)
+    fn = str(m.get("filename") or fk.split("/")[-1])
+    return f"{inv} | {sid} | {tgt} | {fn}"
+
+
 def _render_data_vault_tab(
     *,
     experiments_df: pd.DataFrame,
@@ -684,111 +730,151 @@ def _render_data_vault_tab(
     s2.metric("Unique Baits", f"{unique_baits}")
     s3.metric("Storage Used (MB)", f"{storage_mb:.2f}")
 
-    st.markdown("#### Search & Metadata")
-    bait_query = st.text_input("Search by Bait", placeholder="Type bait (e.g., BCL7, SMARCE1)")
-    bait_query_u = bait_query.strip().upper()
+    st.markdown("#### Filter & layout")
+    bait_query = st.text_input("Search (bait / target / label / filename)", placeholder="e.g. SMARCA4, SWIFT, BCL7")
+    bait_q = bait_query.strip().upper()
 
-    filtered_df = experiments_df.copy()
-    if bait_query_u:
-        filtered_df = filtered_df[
-            filtered_df["bait"].fillna("").astype(str).str.upper().str.contains(bait_query_u, na=False)
-        ]
+    work = experiments_df.copy()
+    if bait_q:
+        def row_matches(r: pd.Series) -> bool:
+            parts = [
+                str(r.get("bait", "")),
+                str(r.get("biological_target", "")),
+                str(r.get("label", "")),
+                str(r.get("filename", "")),
+                str(r.get("file_key", "")),
+                str(r.get("investigator", "")),
+            ]
+            blob = " ".join(parts).upper()
+            return bait_q in blob
 
-    meta_table = filtered_df.copy()
-    meta_table["Processed Date"] = pd.to_datetime(meta_table["mtime"], unit="s", errors="coerce")
-    meta_table["Processed Date"] = meta_table["Processed Date"].dt.strftime("%Y-%m-%d %H:%M")
-    show = meta_table[
+        work = work[work.apply(row_matches, axis=1)]
+
+    fks = work["file_key"].astype(str)
+    work["Target"] = work["file_key"].astype(str).map(lambda fk: _vault_resolve_target_from_meta(meta_by_file.get(fk, {})))
+    work["Date"] = pd.to_datetime(work["mtime"], unit="s", errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+    work["File"] = work["file_key"].astype(str).map(
+        lambda fk: str(meta_by_file.get(fk, {}).get("filename") or fk.split("/")[-1])
+    )
+    work["Domain"] = work["file_key"].astype(str).map(lambda fk: str(meta_by_file.get(fk, {}).get("domain_details") or "—"))
+
+    group_mode = st.radio(
+        "Group rows by",
+        ["None (flat table)", "Investigator", "Session ID"],
+        horizontal=True,
+        key="vault_group_mode",
+    )
+
+    display_base = work[
         [
-            "file_key",
             "investigator",
             "session_id",
+            "Target",
             "label",
-            "bait",
-            "biological_target",
-            "domain_details",
-            "Processed Date",
+            "File",
+            "Domain",
+            "Date",
         ]
     ].rename(
         columns={
-            "file_key": "Path",
             "investigator": "Investigator",
             "session_id": "Session ID",
             "label": "Label",
-            "bait": "Bait",
-            "biological_target": "Bio-Target",
-            "domain_details": "Domain/Details",
         }
     )
-    st.dataframe(show, use_container_width=True, height=280)
 
-    st.markdown("#### Experiment Cards")
-    keys_for_cards = filtered_df["file_key"].astype(str).tolist()
-    if not keys_for_cards:
-        st.caption("No experiments match the current bait filter.")
+    if display_base.empty:
+        st.caption("No experiments match the current filter.")
         return
 
-    cols_per_row = 3
-    for i in range(0, len(keys_for_cards), cols_per_row):
-        row_keys = keys_for_cards[i : i + cols_per_row]
-        cols = st.columns(cols_per_row)
-        for j, fk in enumerate(row_keys):
-            meta = meta_by_file.get(fk, {})
-            bait = meta.get("bait") or "NA"
-            inv = meta.get("investigator") or "NA"
-            sid = meta.get("session_id") or "NA"
-            lbl = meta.get("label") or "NA"
-            fn = meta.get("filename") or fk.split("/")[-1]
-            is_baf_bait = str(bait).upper() in BAF_SUBUNIT_SET
-            bait_tag = " <span style='color:#FF4B4B;'>● BAF</span>" if is_baf_bait else ""
-            df_agg = aggregated_by_file.get(fk)
-            fpath = str(meta.get("path") or os.path.join(data_dir, fk))
+    def sort_key_inv(s: str) -> tuple[Any, ...]:
+        return (str(s).upper() == "N/A", str(s).upper() == "NONE", str(s).lower())
 
-            with cols[j]:
-                st.markdown(
-                    (
-                        "<div class='card'>"
-                        f"<h4 style='margin:0 0 6px 0;'><b>{bait}</b>{bait_tag}</h4>"
-                        f"<div style='opacity:0.9; margin-bottom:4px;'>Investigator: {inv}</div>"
-                        f"<div style='opacity:0.9; margin-bottom:4px;'>Session: {sid}</div>"
-                        f"<div style='opacity:0.9; margin-bottom:8px;'>Label: {lbl}</div>"
-                        f"<div style='font-size:0.9rem; opacity:0.8; word-break:break-word;'>{fn}</div>"
-                        "</div>"
-                    ),
-                    unsafe_allow_html=True,
+    def sort_key_session(s: str) -> tuple[Any, ...]:
+        return (str(s).upper() in ("N/A", "NONE", ""), str(s))
+
+    st.markdown("#### Experiments")
+    row_h = min(520, 80 + 28 * len(display_base))
+
+    if group_mode == "None (flat table)":
+        view = display_base.sort_values(
+            by=["Investigator", "Session ID", "Target", "File"],
+            key=lambda c: c.map(str) if c.name in ("Investigator", "Session ID", "Target", "File") else c,
+            na_position="last",
+            kind="mergesort",
+        ).reset_index(drop=True)
+        st.dataframe(_style_vault_experiment_table(view), use_container_width=True, height=row_h)
+    elif group_mode == "Investigator":
+        invs = sorted(display_base["Investigator"].fillna("—").unique(), key=sort_key_inv)
+        for inv in invs:
+            sub = display_base[display_base["Investigator"].fillna("—") == inv].sort_values(
+                by=["Session ID", "Target", "File"], kind="mergesort"
+            )
+            with st.expander(f"{inv} — {len(sub)} experiment(s)", expanded=len(invs) <= 12):
+                st.dataframe(
+                    _style_vault_experiment_table(sub.reset_index(drop=True)),
+                    use_container_width=True,
+                    height=min(360, 60 + 26 * len(sub)),
+                )
+    else:
+        sids = sorted(display_base["Session ID"].fillna("—").unique(), key=sort_key_session)
+        for sid in sids:
+            sub = display_base[display_base["Session ID"].fillna("—") == sid].sort_values(
+                by=["Investigator", "Target", "File"], kind="mergesort"
+            )
+            with st.expander(f"{sid} — {len(sub)} experiment(s)", expanded=len(sids) <= 16):
+                st.dataframe(
+                    _style_vault_experiment_table(sub.reset_index(drop=True)),
+                    use_container_width=True,
+                    height=min(360, 60 + 26 * len(sub)),
                 )
 
-                if df_agg is not None and not df_agg.empty:
-                    df_download = df_agg.copy().sort_values(
-                        by=["is_baf_core", "Spectral Count", "Confidence Score"],
-                        ascending=[False, False, False],
-                        kind="mergesort",
-                    )
-                    csv_bytes = df_download.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "Download Aggregated Data",
-                        data=csv_bytes,
-                        file_name=_aggregated_download_name(meta, fn),
-                        mime="text/csv",
-                        key=f"download_{fk}",
-                    )
-                else:
-                    st.caption("Aggregated data unavailable for download.")
+    st.markdown("#### Actions")
+    st.caption("Pick one experiment from the filtered list above, then download or delete.")
+    action_keys = work["file_key"].astype(str).tolist()
+    sel = st.selectbox(
+        "Experiment",
+        options=action_keys,
+        format_func=lambda fk: _vault_action_label(fk, meta_by_file),
+        key="vault_action_select",
+    )
+    meta_sel = meta_by_file.get(sel, {})
+    fpath = str(meta_sel.get("path") or os.path.join(data_dir, sel))
+    fn = str(meta_sel.get("filename") or sel.split("/")[-1])
+    df_agg = aggregated_by_file.get(sel)
 
-                confirm_key = f"confirm_delete_{fk}"
-                delete_key = f"delete_{fk}"
-                st.checkbox("Confirm delete", key=confirm_key)
-                if st.button("Delete", key=delete_key):
-                    if st.session_state.get(confirm_key, False):
-                        try:
-                            if os.path.exists(fpath):
-                                os.remove(fpath)
-                            load_portal_data.clear()
-                            st.success(f"Deleted `{fk}`.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Delete failed for `{fk}`: {e}")
-                    else:
-                        st.warning("Tick 'Confirm delete' before deleting this file.")
+    ac1, ac2, ac3 = st.columns([1, 1, 2])
+    with ac1:
+        if df_agg is not None and not df_agg.empty:
+            df_dl = df_agg.sort_values(
+                by=["is_baf_core", "Spectral Count", "Confidence Score"],
+                ascending=[False, False, False],
+                kind="mergesort",
+            )
+            st.download_button(
+                "Download aggregated CSV",
+                data=df_dl.to_csv(index=False).encode("utf-8"),
+                file_name=_aggregated_download_name(meta_sel, fn),
+                mime="text/csv",
+                key="vault_download_selected",
+            )
+        else:
+            st.caption("No aggregated data.")
+    with ac2:
+        del_conf = st.checkbox("Confirm delete", key="vault_delete_confirm")
+    with ac3:
+        if st.button("Delete selected file", key="vault_delete_btn", type="primary"):
+            if not del_conf:
+                st.warning("Enable **Confirm delete** before removing a run.")
+            else:
+                try:
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
+                    load_portal_data.clear()
+                    st.success(f"Deleted `{sel}`.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
 
 
 def main() -> None:
