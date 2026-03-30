@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 from collections import defaultdict
 from typing import Any
 
@@ -22,14 +23,7 @@ from ipms_portal.data_processing import (
 DATA_SOURCE_DIR_DEFAULT = "/Users/sp1665/Downloads/IPMS/Janet_Liu"
 PROJECT_ROOT = os.path.dirname(__file__)
 DATA_EMPTY_MESSAGE = "No datasets found in /Data. Please add IP-MS CSVs to begin analysis."
-
-
-def get_local_data_dir() -> str:
-    """
-    Resolve ./Data relative to the process working directory.
-    Streamlit Cloud runs with cwd at the repo root, so this matches Data/ in the repository.
-    """
-    return os.path.abspath(os.path.normpath(os.path.join(os.getcwd(), "Data")))
+DATA_ROOT = pathlib.Path(__file__).parent.resolve() / "Data"
 CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
 
 
@@ -56,8 +50,8 @@ def _apply_global_css() -> None:
     )
 
 
-def _ensure_local_data_dir(data_dir: str) -> None:
-    os.makedirs(data_dir, exist_ok=True)
+def _ensure_local_data_dir(data_dir: pathlib.Path) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _count_csv_files(data_dir: str) -> int:
@@ -802,8 +796,8 @@ def main() -> None:
     # Inject CSS at app startup so it applies globally.
     _apply_global_css()
 
-    data_dir = get_local_data_dir()
-    print(f"[IPMS Debug] App using Data root (./Data via cwd): {data_dir!r}")
+    data_dir = DATA_ROOT
+    print(f"[IPMS Debug] App using Data root: {str(data_dir)!r}")
     print(f"[IPMS Debug] os.getcwd(): {os.getcwd()!r}")
 
     st.title("BAF-Vault: IP-MS Encyclopedia")
@@ -818,7 +812,7 @@ def main() -> None:
         if "data_refresh_token" not in st.session_state:
             st.session_state["data_refresh_token"] = 0
         st.markdown("### Data Directory & File Management")
-        st.caption(f"Local data: `{data_dir}` (use `Data/[Investigator]/file.csv`; cwd-relative `./Data`)")
+        st.caption(f"Local data: `{str(data_dir)}` (use `Data/[Investigator]/file.csv`)")
 
         upload_subfolder = st.text_input(
             "Upload subfolder under Data/",
@@ -836,7 +830,7 @@ def main() -> None:
             try:
                 counts = save_uploaded_csvs_to_local_data(
                     uploaded_files,
-                    data_dir,
+                    str(data_dir),
                     overwrite=overwrite,
                     subfolder=str(upload_subfolder or "Imported"),
                 )
@@ -850,7 +844,7 @@ def main() -> None:
             st.session_state["data_refresh_token"] += 1
             load_portal_data.clear()
 
-        local_csv_count = _count_csv_files(data_dir)
+        local_csv_count = _count_csv_files(str(data_dir))
         if local_csv_count == 0:
             st.info(DATA_EMPTY_MESSAGE)
             st.stop()
@@ -858,7 +852,7 @@ def main() -> None:
         st.markdown("---")
         st.markdown("### Dataset Browser")
         experiments_df, aggregated_by_file, meta_by_file, skipped_files = load_portal_data(
-            data_dir,
+            str(data_dir),
             st.session_state["data_refresh_token"],
         )
 
@@ -1130,7 +1124,7 @@ def main() -> None:
             experiments_df=experiments_df,
             aggregated_by_file=aggregated_by_file,
             meta_by_file=meta_by_file,
-            data_dir=data_dir,
+            data_dir=str(data_dir),
         )
 
     with tab_global:
