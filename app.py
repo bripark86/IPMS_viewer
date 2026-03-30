@@ -11,7 +11,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from ipms_portal.biological_aliases import BAF_SUBUNIT_SET, expand_biological_target_string
+from ipms_portal.biological_aliases import (
+    BAF_SUBUNIT_SET,
+    expand_biological_target_string,
+    infer_bait_gene_from_label,
+)
 from ipms_portal.constants import BAF_CORE_COLOR, BAF_SUBUNITS
 from ipms_portal.data_processing import (
     add_baf_core_indicator,
@@ -28,6 +32,7 @@ DATA_ROOT = pathlib.Path(__file__).parent.resolve() / "Data"
 # Avoid StreamlitAPIException: never assign to portal_dataset_select after its widget is created;
 # set this before the main selectbox runs, then pop and apply.
 _PENDING_PORTAL_DATASET_KEY = "_pending_portal_dataset"
+ACTIVE_DATASET_STATE_KEY = "active_dataset_id"
 CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
 
 
@@ -335,107 +340,142 @@ def load_portal_data(
     return experiments_df, aggregated_by_file, meta_by_file, skipped_files
 
 
-def _volcano_plot(df_gene: pd.DataFrame) -> go.Figure:
+def _infer_bait_gene_for_volcano(meta: dict[str, Any]) -> str | None:
+    """Gene symbol for bait marker (diamond). Returns None if not inferable (e.g. EV only)."""
+    bait_raw = str(meta.get("bait") or "").strip()
+    if bait_raw and bait_raw.upper() not in ("N/A", "NA", "—", ""):
+        m = re.match(r"^([A-Za-z0-9]+)", bait_raw)
+        if m:
+            return m.group(1).upper()
+    ig = infer_bait_gene_from_label(meta.get("label"))
+    return ig.upper() if ig else None
+
+
+@st.cache_data(show_spinner=False)
+def draw_volcano_plot(
+    active_dataset_id: str, active_dataset: pd.DataFrame, *, bait_gene: str | None
+) -> go.Figure:
+    """
+    Volcano: X = Spectral Count (abundance proxy), Y = -log10(LDA probability).
+    BAF subunits (26): red circles. Inferred bait: red diamond (or gold if non-BAF bait).
+    """
     base_color = "#00A6ED"
     core_color = BAF_CORE_COLOR
+    bait_non_baf_color = "#FFD700"
 
-    df_gene = df_gene.copy()
-    df_gene = df_gene.dropna(subset=["Log_Prob", "Spectral Count"], how="any")
+    df = active_dataset.copy()
+    df["Spectral Count"] = pd.to_numeric(df["Spectral Count"], errors="coerce")
+    df["Log_Prob"] = pd.to_numeric(df["Log_Prob"], errors="coerce")
+    df = df.dropna(subset=["Log_Prob", "Spectral Count"], how="any")
+    df = df[df["Spectral Count"] > 0]
 
-    if df_gene.empty:
+    if df.empty:
         fig = go.Figure()
         fig.update_layout(
             template="plotly_dark",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             xaxis_title="Spectral Count",
-            yaxis_title="-log10(Avg LDA Probability)",
+            yaxis_title="-log10(LDA Probability)",
         )
         return fig
 
-    df_core = df_gene[df_gene["is_baf_core"] == True]
-    df_non = df_gene[df_gene["is_baf_core"] == False]
+    genes_u = df["Gene Symbol"].astype(str).str.strip().str.upper()
+    bait_u = bait_gene.strip().upper() if bait_gene else None
+    is_bait = genes_u == bait_u if bait_u else pd.Series(False, index=df.index)
+    is_baf = df["is_baf_core"] == True
+
+    df_bait = df.loc[is_bait]
+    df_baf_circle = df.loc[is_baf & ~is_bait]
+    df_prey = df.loc[~is_baf & ~is_bait]
+
+    pos = df["Spectral Count"].astype(float)
+    pos_only = pos[pos > 0]
+    use_log_x = False
+    if len(pos_only) >= 3:
+        ratio = float(pos_only.max()) / float(max(pos_only.min(), 1.0))
+        use_log_x = pos_only.max() > 80 or ratio >= 25.0
 
     fig = go.Figure()
-    if not df_non.empty:
+
+    def _scatter_trace(d: pd.DataFrame, *, name: str, color: str, size: int, symbol: str | None) -> None:
+        if d.empty:
+            return
+        mk: dict[str, Any] = dict(size=size, color=color, opacity=0.9, line=dict(width=0.5, color="#FFFFFF"))
+        if symbol:
+            mk["symbol"] = symbol
         fig.add_trace(
             go.Scatter(
-                x=df_non["Spectral Count"],
-                y=df_non["Log_Prob"],
+                x=d["Spectral Count"],
+                y=d["Log_Prob"],
                 mode="markers",
-                name="Non-BAF",
-                marker=dict(size=8, color=base_color, opacity=0.85),
+                name=name,
+                marker=mk,
                 customdata=np.stack(
                     [
-                        df_non["Gene Symbol"].astype(str).values,
-                        df_non["Unique Peptides"].values,
-                        df_non["Spectral Count"].values,
+                        d["Gene Symbol"].astype(str).values,
+                        d["Unique Peptides"].values,
+                        d["Spectral Count"].values,
                     ],
                     axis=-1,
                 ),
                 hovertemplate=(
                     "<b>%{customdata[0]}</b><br>"
-                    "Unique Peptides: %{customdata[1]}<br>"
                     "Spectral Count: %{customdata[2]}<br>"
+                    "Unique Peptides: %{customdata[1]}<br>"
                     "<extra></extra>"
                 ),
             )
         )
 
-    if not df_core.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=df_core["Spectral Count"],
-                y=df_core["Log_Prob"],
-                mode="markers",
-                name="BAF Core",
-                marker=dict(size=14, color=core_color, line=dict(width=1, color="#FFFFFF"), opacity=0.95),
-                customdata=np.stack(
-                    [
-                        df_core["Gene Symbol"].astype(str).values,
-                        df_core["Unique Peptides"].values,
-                        df_core["Spectral Count"].values,
-                    ],
-                    axis=-1,
-                ),
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b><br>"
-                    "Unique Peptides: %{customdata[1]}<br>"
-                    "Spectral Count: %{customdata[2]}<br>"
-                    "<extra></extra>"
-                ),
-            )
-        )
+    _scatter_trace(df_prey, name="Prey / other", color=base_color, size=7, symbol=None)
+    _scatter_trace(df_baf_circle, name="BAF core (26)", color=core_color, size=12, symbol=None)
+
+    if bait_u and not df_bait.empty:
+        bcol = core_color if bait_u in BAF_SUBUNIT_SET else bait_non_baf_color
+        _scatter_trace(df_bait, name=f"Bait ({bait_u})", color=bcol, size=18, symbol="diamond")
+    elif bait_u and df_bait.empty:
+        # Bait not identified as a detected gene in this table — still show in legend via caption only
+        pass
+
+    xaxis_cfg: dict[str, Any] = dict(
+        title="Spectral Count (log scale)" if use_log_x else "Spectral Count",
+        gridcolor="rgba(255,255,255,0.08)",
+        type="log" if use_log_x else "linear",
+    )
 
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=30, r=10, t=30, b=30),
-        xaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
-        yaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
+        xaxis=xaxis_cfg,
+        yaxis=dict(gridcolor="rgba(255,255,255,0.08)", title="-log10(LDA Probability)"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis_title="Spectral Count",
-        yaxis_title="-log10(Avg LDA Probability)",
     )
     return fig
 
 
-def _coverage_plot(df_gene: pd.DataFrame) -> go.Figure:
-    # Horizontal coverage: spectral count per BAF subunit (0 if absent).
-    df_gene2 = df_gene.copy()
-    sub_df = pd.DataFrame({"Gene Symbol": BAF_SUBUNITS})
-    merged = sub_df.merge(df_gene2[["Gene Symbol", "Spectral Count"]], on="Gene Symbol", how="left")
-    merged["Spectral Count"] = merged["Spectral Count"].fillna(0).astype(float)
+@st.cache_data(show_spinner=False)
+def draw_complex_coverage(active_dataset_id: str, active_dataset: pd.DataFrame) -> go.Figure:
+    """All BAF_SUBUNITS on Y-axis; missing subunits show 0 (gaps visible). Order = canonical list."""
+    gs_u = active_dataset["Gene Symbol"].astype(str).str.strip().str.upper()
+    sc = pd.to_numeric(active_dataset["Spectral Count"], errors="coerce").fillna(0.0)
+    counts = pd.DataFrame({"_g": gs_u, "_s": sc}).groupby("_g", sort=False)["_s"].sum()
+
+    rows: list[dict[str, Any]] = []
+    for gene in BAF_SUBUNITS:
+        v = float(counts.get(gene, 0.0) or 0.0)
+        rows.append({"Gene Symbol": gene, "Spectral Count": v})
+    merged = pd.DataFrame(rows)
 
     merged["present"] = merged["Spectral Count"] > 0
-    merged["color"] = np.where(merged["present"], BAF_CORE_COLOR, "rgba(255,255,255,0.20)")
+    merged["color"] = np.where(merged["present"], BAF_CORE_COLOR, "rgba(120,120,120,0.35)")
 
-    merged = merged.sort_values("Spectral Count", ascending=True)
     fig = go.Figure(
         go.Bar(
             x=merged["Spectral Count"],
-            y=merged["Gene Symbol"],
+            y=merged["Gene Symbol"].astype(str),
             orientation="h",
             marker=dict(color=merged["color"].tolist()),
             hovertemplate="BAF subunit: %{y}<br>Spectral Count: %{x}<extra></extra>",
@@ -448,7 +488,8 @@ def _coverage_plot(df_gene: pd.DataFrame) -> go.Figure:
         margin=dict(l=180, r=10, t=30, b=30),
         xaxis_title="Spectral Count",
         yaxis_title="",
-        yaxis=dict(tickfont=dict(size=12)),
+        yaxis=dict(tickfont=dict(size=11), categoryorder="array", categoryarray=list(BAF_SUBUNITS)),
+        title=dict(text="BAF complex coverage (0 = not detected)", font=dict(size=14)),
     )
     return fig
 
@@ -1088,6 +1129,14 @@ def main() -> None:
         st.error(f"Failed to load data for the selected experiment. Details: {e}")
         st.stop()
 
+    prev_active = st.session_state.get(ACTIVE_DATASET_STATE_KEY)
+    if prev_active is not None and prev_active != selected_dataset:
+        draw_volcano_plot.clear()
+        draw_complex_coverage.clear()
+    st.session_state[ACTIVE_DATASET_STATE_KEY] = selected_dataset
+
+    bait_gene_for_volcano = _infer_bait_gene_for_volcano(meta_by_file.get(selected_dataset, {}))
+
     tab_main, tab_cmp, tab_vault, tab_global, tab_batch, tab_multi = st.tabs(
         [
             "Main Dashboard",
@@ -1111,10 +1160,22 @@ def main() -> None:
         c3.metric("Top Interactor", top_interactor if top_interactor else "NA")
 
         st.markdown("### Volcano Plot")
-        st.plotly_chart(_volcano_plot(df_gene), use_container_width=True)
+        st.plotly_chart(
+            draw_volcano_plot(
+                selected_dataset,
+                df_gene,
+                bait_gene=bait_gene_for_volcano,
+            ),
+            use_container_width=True,
+            key=f"main_volcano_{selected_dataset}",
+        )
 
         st.markdown("### Complex Coverage (BAF Subunits Pulled Down)")
-        st.plotly_chart(_coverage_plot(df_gene), use_container_width=True)
+        st.plotly_chart(
+            draw_complex_coverage(selected_dataset, df_gene),
+            use_container_width=True,
+            key=f"main_coverage_{selected_dataset}",
+        )
 
         st.markdown("### Gene-Level Aggregated Table")
         df_view = df_gene.copy()
