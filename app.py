@@ -294,6 +294,24 @@ def _short_dataset_label(file_key: str, meta: dict[str, Any], *, max_len: int = 
     return (fn[: max_len - 1] + "…") if len(fn) > max_len else fn
 
 
+def _log_prob_y_with_jitter(log_prob: pd.Series, gene_symbols: pd.Series) -> np.ndarray:
+    """Slight Y jitter when many genes share the same -log10(p) so markers don't stack."""
+    y = log_prob.astype(float).to_numpy()
+    if len(y) == 0:
+        return y
+    genes = tuple(gene_symbols.astype(str).tolist())
+    y_key = tuple(np.round(y, 9).tolist())
+    seed = abs(hash((genes, y_key))) % (2**32 - 1)
+    rng = np.random.default_rng(seed)
+    y_r = np.round(y, 12)
+    _, inv, counts = np.unique(y_r, return_inverse=True, return_counts=True)
+    jitter = np.zeros(len(y), dtype=float)
+    dup = counts[inv] > 1
+    if dup.any():
+        jitter[dup] = rng.normal(0.0, 0.028, size=int(dup.sum()))
+    return y + jitter
+
+
 def _normalize_total_spectral_column(df: pd.DataFrame) -> pd.DataFrame:
     """Return a copy with Spectral Count scaled to PPM (×1e6) of the run's total spectral count."""
     out = df.copy()
@@ -341,6 +359,9 @@ def _make_volcano_figure(
         )
         return fig
 
+    df = df.copy()
+    df["Log_Prob_plot"] = _log_prob_y_with_jitter(df["Log_Prob"], df["Gene Symbol"])
+
     genes_u = df["Gene Symbol"].astype(str).str.strip().str.upper()
     bait_u = bait_gene.strip().upper() if bait_gene else None
     is_bait = genes_u == bait_u if bait_u else pd.Series(False, index=df.index)
@@ -384,7 +405,7 @@ def _make_volcano_figure(
         fig.add_trace(
             go.Scatter(
                 x=d["Spectral Count"],
-                y=d["Log_Prob"],
+                y=d["Log_Prob_plot"],
                 mode="markers",
                 name=name,
                 marker=mk,
@@ -393,6 +414,7 @@ def _make_volcano_figure(
                         d["Gene Symbol"].astype(str).values,
                         d["Unique Peptides"].values,
                         d["Spectral Count"].values,
+                        d["Log_Prob"].values,
                     ],
                     axis=-1,
                 ),
@@ -400,6 +422,7 @@ def _make_volcano_figure(
                     "<b>%{customdata[0]}</b><br>"
                     "Spectral Count: %{customdata[2]}<br>"
                     "Unique Peptides: %{customdata[1]}<br>"
+                    "-log10(LDA prob): %{customdata[3]:.4f}<br>"
                     "<extra></extra>"
                 ),
             )
@@ -1532,10 +1555,10 @@ def main() -> None:
         df_view = df_gene.copy()
         df_view["Confidence Score"] = pd.to_numeric(df_view["Confidence Score"], errors="coerce")
         df_view["Spectral Count"] = pd.to_numeric(df_view["Spectral Count"], errors="coerce")
-        # Put BAF core genes first while preserving highest-signal rows near top.
+        # Default table order: strongest spectral signal first (stable ties).
         df_view = df_view.sort_values(
-            by=["is_baf_core", "Spectral Count", "Confidence Score"],
-            ascending=[False, False, False],
+            by=["Spectral Count", "Confidence Score", "Gene Symbol"],
+            ascending=[False, False, True],
             kind="mergesort",
         )
 
@@ -1558,8 +1581,8 @@ def main() -> None:
 
         meta_cur = meta_by_file.get(selected_dataset, {})
         dl = df_view.sort_values(
-            by=["is_baf_core", "Spectral Count", "Confidence Score"],
-            ascending=[False, False, False],
+            by=["Spectral Count", "Confidence Score", "Gene Symbol"],
+            ascending=[False, False, True],
             kind="mergesort",
         )
         st.download_button(

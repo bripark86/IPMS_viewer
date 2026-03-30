@@ -57,6 +57,12 @@ def resolve_biological_fields(
         bio = "N/A"
         domain = "Bromodomain Isolation"
 
+    # If no domain shorthand matched, promote inferred bait gene to biological target (e.g. SMARCA2).
+    if bio == "N/A" and bait_gene_guess:
+        guess = str(bait_gene_guess).strip().upper()
+        if guess and guess not in ("N/A", "NA", "NONE"):
+            bio = guess
+
     return bio, domain, display
 
 

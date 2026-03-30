@@ -60,15 +60,53 @@ def _select_and_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
                 return col
         return None
 
+    def resolve_lda_probability_column() -> Optional[str]:
+        """
+        Use the numeric LDA Probability column only — never LDA Score or unrelated LDA* columns.
+        """
+        # Exact / near-exact headers first
+        for want in ("LDA Probability", "LDA probability", "Prob LDA"):
+            wn = _normalize_col(want)
+            if wn in normalized:
+                return normalized[wn]
+            wf = re.sub(r"[\s_]+", "", wn).lower()
+            for col in df.columns:
+                cf = re.sub(r"[\s_]+", "", _normalize_col(col)).lower()
+                if cf == wf:
+                    return col
+        # Fuzzy: contains lda + prob, excludes score (never use LDA Score)
+        candidates: list[str] = []
+        for col in df.columns:
+            cf = re.sub(r"[\s_]+", "", _normalize_col(col)).lower()
+            if "lda" not in cf:
+                continue
+            if "score" in cf:
+                continue
+            if "prob" in cf or cf.endswith("prob") or "probability" in cf:
+                candidates.append(col)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        def _prob_col_rank(col: str) -> tuple[int, str]:
+            cf = re.sub(r"[\s_]+", "", _normalize_col(col)).lower()
+            pri = 0
+            if "probability" in cf:
+                pri -= 3
+            if "prob" in cf:
+                pri -= 1
+            return (pri, col)
+
+        return min(candidates, key=_prob_col_rank)
+
     col_gene = resolve("Gene Symbol")
     col_peptide = resolve("Peptide")
-    col_lda = resolve("LDA Probability")
+    col_lda = resolve_lda_probability_column()
     col_xcorr = resolve("XCorr")
 
     if col_gene is None or col_peptide is None:
         raise ValueError("Missing required columns for aggregation (Gene Symbol and/or Peptide).")
-    if col_lda is None:
-        col_lda = None
 
     keep = {"Gene Symbol": col_gene, "Peptide": col_peptide}
     if col_lda is not None:
@@ -81,7 +119,27 @@ def _select_and_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df2
 
 
-def load_and_aggregate_csv(path: str, required_eps: float = 1e-12) -> pd.DataFrame:
+def _coerce_lda_probability_series(s: pd.Series) -> pd.Series:
+    """
+    Force numeric LDA probability; map placeholders to NaN. Valid range for aggregation: (0, 1].
+    Values in (1, 100] are treated as percents and scaled.
+    """
+    s2 = s.astype(str).str.strip() if s.dtype == object or str(s.dtype) == "string" else s
+    if s.dtype == object or str(s.dtype) == "string":
+        u = s2.str.upper()
+        bad = u.isin(["", "N/A", "NA", "NAN", "NONE", "NULL", "-", "—"]) | u.str.match(r"^N/?A$", na=False)
+        s2 = s2.where(~bad, np.nan)
+        num = pd.to_numeric(s2, errors="coerce")
+    else:
+        num = pd.to_numeric(s, errors="coerce")
+    num = num.astype(float)
+    pct = num.notna() & (num > 1.0) & (num <= 100.0)
+    num = num.where(~pct, num / 100.0)
+    num = num.where(num.notna() & (num > 0.0) & (num <= 1.0), np.nan)
+    return num
+
+
+def load_and_aggregate_csv(path: str) -> pd.DataFrame:
     header_idx = _find_header_row(
         path, required_markers=("Gene Symbol", "Peptide"), max_lines=300
     )
@@ -101,7 +159,7 @@ def load_and_aggregate_csv(path: str, required_eps: float = 1e-12) -> pd.DataFra
     df["Peptide"] = df["Peptide"].astype(str).str.strip()
 
     if "LDA Probability" in df.columns:
-        df["LDA Probability"] = pd.to_numeric(df["LDA Probability"], errors="coerce")
+        df["LDA Probability"] = _coerce_lda_probability_series(df["LDA Probability"])
     else:
         df["LDA Probability"] = np.nan
 
@@ -111,8 +169,11 @@ def load_and_aggregate_csv(path: str, required_eps: float = 1e-12) -> pd.DataFra
     avg_lda = grouped["LDA Probability"].mean().rename("Confidence Score")
 
     out = pd.concat([spectral_count, unique_peptides, avg_lda], axis=1).reset_index()
-    out["Log_Prob"] = -np.log10(out["Confidence Score"].fillna(0.0).clip(lower=0.0) + required_eps)
-    out.loc[out["Confidence Score"].isna(), "Log_Prob"] = np.nan
+    cs = pd.to_numeric(out["Confidence Score"], errors="coerce")
+    out["Confidence Score"] = cs
+    valid_prob = cs.notna() & (cs > 0.0) & (cs <= 1.0)
+    out["Log_Prob"] = np.nan
+    out.loc[valid_prob, "Log_Prob"] = -np.log10(cs.loc[valid_prob])
 
     return out
 
