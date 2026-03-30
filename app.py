@@ -192,68 +192,6 @@ def _lab_consensus_table(
     return out
 
 
-def _scatter_matrix_spectral(
-    selected_keys: list[str],
-    aggregated_by_file: dict[str, pd.DataFrame],
-    meta_by_file: dict[str, dict[str, Any]],
-) -> go.Figure:
-    genes: set[str] = set()
-    for k in selected_keys:
-        df = aggregated_by_file.get(k)
-        if df is not None and not df.empty:
-            genes.update(df["Gene Symbol"].astype(str).tolist())
-
-    short_labels: dict[str, str] = {}
-    for k in selected_keys:
-        m = meta_by_file.get(k, {})
-        fn = m.get("filename") or k.split("/")[-1]
-        short_labels[k] = (fn[:28] + "…") if len(fn) > 28 else fn
-
-    rows_data: list[dict[str, Any]] = []
-    for g in genes:
-        row: dict[str, Any] = {"Gene": g, "is_baf": g in BAF_SUBUNIT_SET}
-        for k in selected_keys:
-            df = aggregated_by_file.get(k)
-            if df is None or df.empty:
-                row[short_labels[k]] = 0.0
-                continue
-            hit = df[df["Gene Symbol"].astype(str) == g]
-            row[short_labels[k]] = float(hit["Spectral Count"].iloc[0]) if not hit.empty else 0.0
-        rows_data.append(row)
-
-    dfm = pd.DataFrame(rows_data)
-    dim_cols = [short_labels[k] for k in selected_keys]
-    colors = [BAF_CORE_COLOR if bool(b) else "#00A6ED" for b in dfm["is_baf"]]
-    sizes = [11 if bool(b) else 6 for b in dfm["is_baf"]]
-
-    dims = [dict(label=c, values=dfm[c]) for c in dim_cols]
-    fig = go.Figure(
-        data=go.Splom(
-            dimensions=dims,
-            marker=dict(
-                color=colors,
-                size=sizes,
-                line=dict(width=0.4, color="rgba(255,255,255,0.65)"),
-                opacity=0.9,
-            ),
-            text=dfm["Gene"],
-            hovertemplate="<b>%{text}</b><br>%{xaxis.title.text}: %{x}<br>%{yaxis.title.text}: %{y}<extra></extra>",
-            showupperhalf=True,
-        )
-    )
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        title="Spectral Count — multi-experiment scatter matrix (BAF genes emphasized)",
-        dragmode="select",
-        font=dict(color="#E6EDF3"),
-        margin=dict(l=40, r=20, t=60, b=40),
-        height=640,
-    )
-    return fig
-
-
 def _pick_top_interactor(df: pd.DataFrame) -> str | None:
     if df.empty:
         return None
@@ -351,13 +289,36 @@ def _infer_bait_gene_for_volcano(meta: dict[str, Any]) -> str | None:
     return ig.upper() if ig else None
 
 
-@st.cache_data(show_spinner=False)
-def draw_volcano_plot(
-    active_dataset_id: str, active_dataset: pd.DataFrame, *, bait_gene: str | None
+def _short_dataset_label(file_key: str, meta: dict[str, Any], *, max_len: int = 32) -> str:
+    fn = str(meta.get("filename") or file_key.split("/")[-1])
+    return (fn[: max_len - 1] + "…") if len(fn) > max_len else fn
+
+
+def _normalize_total_spectral_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with Spectral Count scaled to PPM (×1e6) of the run's total spectral count."""
+    out = df.copy()
+    sc = pd.to_numeric(out["Spectral Count"], errors="coerce").fillna(0.0)
+    tot = float(sc.sum())
+    if tot > 0:
+        out["Spectral Count"] = sc / tot * 1_000_000.0
+    else:
+        out["Spectral Count"] = sc
+    return out
+
+
+def _make_volcano_figure(
+    active_dataset: pd.DataFrame,
+    *,
+    bait_gene: str | None,
+    force_log_x: bool | None = None,
+    xaxis_range: tuple[float, float] | None = None,
+    yaxis_range: tuple[float, float] | None = None,
+    emphasize_baf_only: bool = False,
+    xaxis_title: str | None = None,
 ) -> go.Figure:
     """
     Volcano: X = Spectral Count (abundance proxy), Y = -log10(LDA probability).
-    BAF subunits (26): red circles. Inferred bait: red diamond (or gold if non-BAF bait).
+    BAF subunits: red circles. Bait: diamond. If emphasize_baf_only, dim non-BAF preys.
     """
     base_color = "#00A6ED"
     core_color = BAF_CORE_COLOR
@@ -375,7 +336,7 @@ def draw_volcano_plot(
             template="plotly_dark",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            xaxis_title="Spectral Count",
+            xaxis_title=xaxis_title or "Spectral Count",
             yaxis_title="-log10(LDA Probability)",
         )
         return fig
@@ -392,16 +353,32 @@ def draw_volcano_plot(
     pos = df["Spectral Count"].astype(float)
     pos_only = pos[pos > 0]
     use_log_x = False
-    if len(pos_only) >= 3:
+    if force_log_x is not None:
+        use_log_x = force_log_x
+    elif len(pos_only) >= 3:
         ratio = float(pos_only.max()) / float(max(pos_only.min(), 1.0))
         use_log_x = pos_only.max() > 80 or ratio >= 25.0
 
     fig = go.Figure()
 
-    def _scatter_trace(d: pd.DataFrame, *, name: str, color: str, size: int, symbol: str | None) -> None:
+    def _scatter_trace(
+        d: pd.DataFrame,
+        *,
+        name: str,
+        color: str,
+        size: int,
+        symbol: str | None,
+        prey_dimmed: bool = False,
+    ) -> None:
         if d.empty:
             return
-        mk: dict[str, Any] = dict(size=size, color=color, opacity=0.9, line=dict(width=0.5, color="#FFFFFF"))
+        opacity = 0.14 if prey_dimmed else 0.9
+        mk: dict[str, Any] = dict(
+            size=size,
+            color=color,
+            opacity=opacity,
+            line=dict(width=0.5, color="#FFFFFF"),
+        )
         if symbol:
             mk["symbol"] = symbol
         fig.add_trace(
@@ -428,21 +405,32 @@ def draw_volcano_plot(
             )
         )
 
-    _scatter_trace(df_prey, name="Prey / other", color=base_color, size=7, symbol=None)
+    prey_dim = bool(emphasize_baf_only)
+    _scatter_trace(df_prey, name="Prey / other", color=base_color, size=7, symbol=None, prey_dimmed=prey_dim)
     _scatter_trace(df_baf_circle, name="BAF core (26)", color=core_color, size=12, symbol=None)
 
     if bait_u and not df_bait.empty:
         bcol = core_color if bait_u in BAF_SUBUNIT_SET else bait_non_baf_color
         _scatter_trace(df_bait, name=f"Bait ({bait_u})", color=bcol, size=18, symbol="diamond")
-    elif bait_u and df_bait.empty:
-        # Bait not identified as a detected gene in this table — still show in legend via caption only
-        pass
 
+    default_xtitle = "Spectral Count (log scale)" if use_log_x else "Spectral Count"
     xaxis_cfg: dict[str, Any] = dict(
-        title="Spectral Count (log scale)" if use_log_x else "Spectral Count",
+        title=(xaxis_title or default_xtitle),
         gridcolor="rgba(255,255,255,0.08)",
         type="log" if use_log_x else "linear",
     )
+    if xaxis_range is not None:
+        lo, hi = float(xaxis_range[0]), float(xaxis_range[1])
+        if lo <= 0 or hi <= 0:
+            pass
+        elif use_log_x:
+            xaxis_cfg["range"] = [np.log10(max(lo, 1e-12)), np.log10(max(hi, 1e-12))]
+        else:
+            xaxis_cfg["range"] = [lo, hi]
+
+    yaxis_cfg: dict[str, Any] = dict(gridcolor="rgba(255,255,255,0.08)", title="-log10(LDA Probability)")
+    if yaxis_range is not None:
+        yaxis_cfg["range"] = [float(yaxis_range[0]), float(yaxis_range[1])]
 
     fig.update_layout(
         template="plotly_dark",
@@ -450,10 +438,150 @@ def draw_volcano_plot(
         plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=30, r=10, t=30, b=30),
         xaxis=xaxis_cfg,
-        yaxis=dict(gridcolor="rgba(255,255,255,0.08)", title="-log10(LDA Probability)"),
+        yaxis=yaxis_cfg,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     return fig
+
+
+def _volcano_xy_limits_for_compare(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    *,
+    normalize_total: bool,
+) -> tuple[bool, tuple[float, float], tuple[float, float]]:
+    """Shared log/linear X choice and padded numeric ranges for paired volcanoes."""
+    frames: list[pd.DataFrame] = []
+    for raw in (df_a, df_b):
+        d = raw.copy()
+        if normalize_total:
+            d = _normalize_total_spectral_column(d)
+        d["Spectral Count"] = pd.to_numeric(d["Spectral Count"], errors="coerce")
+        d["Log_Prob"] = pd.to_numeric(d["Log_Prob"], errors="coerce")
+        d = d.dropna(subset=["Log_Prob", "Spectral Count"], how="any")
+        d = d[d["Spectral Count"] > 0]
+        frames.append(d)
+    combo = pd.concat(frames, axis=0, ignore_index=True)
+    if combo.empty:
+        return False, (0.0, 1.0), (0.0, 1.0)
+
+    pos = combo["Spectral Count"].astype(float)
+    yv = combo["Log_Prob"].astype(float)
+    use_log_x = False
+    if len(pos) >= 3:
+        ratio = float(pos.max()) / float(max(float(pos.min()), 1.0))
+        use_log_x = float(pos.max()) > 80 or ratio >= 25.0
+
+    x_lo, x_hi = float(pos.min()), float(pos.max())
+    y_lo, y_hi = float(yv.min()), float(yv.max())
+    x_pad = (x_hi - x_lo) * 0.06 + 1e-6
+    y_pad = (y_hi - y_lo) * 0.06 + 1e-6
+    if use_log_x:
+        x_lo = max(x_lo * 0.85, 1e-12)
+        x_hi = x_hi * 1.15
+    else:
+        x_lo = max(0.0, x_lo - x_pad)
+        x_hi = x_hi + x_pad
+    y_lo = y_lo - y_pad
+    y_hi = y_hi + y_pad
+    return use_log_x, (x_lo, x_hi), (y_lo, y_hi)
+
+
+def _correlation_heatmap_spectral(
+    selected_keys: list[str],
+    aggregated_by_file: dict[str, pd.DataFrame],
+    meta_by_file: dict[str, dict[str, Any]],
+    *,
+    normalize_total: bool,
+    baf_genes_only: bool = False,
+) -> go.Figure:
+    """Pearson correlation of log1p(spectral counts) across experiments."""
+    short_labels: dict[str, str] = {
+        k: _short_dataset_label(k, meta_by_file.get(k, {})) for k in selected_keys
+    }
+    col_names = [short_labels[k] for k in selected_keys]
+
+    genes: set[str] = set()
+    for k in selected_keys:
+        df = aggregated_by_file.get(k)
+        if df is None or df.empty:
+            continue
+        m = pd.to_numeric(df["Spectral Count"], errors="coerce").fillna(0.0) > 0
+        genes.update(df.loc[m, "Gene Symbol"].astype(str).str.strip().str.upper().tolist())
+
+    if baf_genes_only:
+        genes = genes & BAF_SUBUNIT_SET
+
+    if not genes:
+        fig = go.Figure()
+        t = (
+            "No BAF subunits with spectral signal across these runs"
+            if baf_genes_only
+            else "No genes with spectral signal to correlate"
+        )
+        fig.update_layout(template="plotly_dark", title=t)
+        return fig
+
+    mat = pd.DataFrame(0.0, index=sorted(genes), columns=col_names, dtype=float)
+    for k, c in zip(selected_keys, col_names):
+        df = aggregated_by_file.get(k)
+        if df is None or df.empty:
+            continue
+        d = df.copy()
+        gs = d["Gene Symbol"].astype(str).str.strip().str.upper()
+        sc = pd.to_numeric(d["Spectral Count"], errors="coerce").fillna(0.0)
+        if normalize_total and float(sc.sum()) > 0:
+            sc = sc / float(sc.sum()) * 1_000_000.0
+        sub = pd.Series(sc.values, index=gs)
+        sub = sub[~sub.index.duplicated(keep="first")]
+        for g in mat.index:
+            if g in sub.index:
+                mat.at[g, c] = float(sub.loc[g])
+
+    logm = np.log1p(mat)
+    corr = logm.corr()
+    corr = corr.fillna(0.0)
+    z_heat = corr.to_numpy(dtype=float, copy=True)
+    np.fill_diagonal(z_heat, 1.0)
+
+    labels = list(corr.columns)
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z_heat,
+            x=labels,
+            y=labels,
+            zmin=-1,
+            zmax=1,
+            colorscale="RdBu",
+            reversescale=True,
+            colorbar=dict(title="r"),
+            hovertemplate="%{x} vs %{y}<br>r = %{z:.3f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        title=(
+            "Spectral-count correlation (Pearson on log₁ₚ signal"
+            + ("; PPM-normalized" if normalize_total else "")
+            + ("; BAF subunits only" if baf_genes_only else "")
+            + ")"
+        ),
+        font=dict(color="#E6EDF3"),
+        margin=dict(l=100, r=40, t=60, b=100),
+        xaxis=dict(side="bottom", tickangle=-35),
+        yaxis=dict(autorange="reversed"),
+        height=max(420, 80 + 48 * len(labels)),
+    )
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def draw_volcano_plot(
+    active_dataset_id: str, active_dataset: pd.DataFrame, *, bait_gene: str | None
+) -> go.Figure:
+    return _make_volcano_figure(active_dataset, bait_gene=bait_gene)
 
 
 @st.cache_data(show_spinner=False)
@@ -494,38 +622,61 @@ def draw_complex_coverage(active_dataset_id: str, active_dataset: pd.DataFrame) 
     return fig
 
 
-def _comparison_table(df_a: pd.DataFrame, df_b: pd.DataFrame) -> pd.DataFrame:
-    a = df_a.rename(
+def _comparison_table(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    *,
+    normalize_total: bool = False,
+) -> pd.DataFrame:
+    """Outer join on Gene Symbol. Presence (Venn) uses raw spectral > 0; display counts optionally PPM-normalized."""
+    a = df_a.copy()
+    b = df_b.copy()
+    a_raw = pd.to_numeric(a["Spectral Count"], errors="coerce")
+    b_raw = pd.to_numeric(b["Spectral Count"], errors="coerce")
+    tot_a, tot_b = float(a_raw.sum()), float(b_raw.sum())
+
+    if normalize_total and tot_a > 0:
+        a_disp = a_raw / tot_a * 1_000_000.0
+    else:
+        a_disp = a_raw
+    if normalize_total and tot_b > 0:
+        b_disp = b_raw / tot_b * 1_000_000.0
+    else:
+        b_disp = b_raw
+
+    a = a.rename(
         columns={
-            "Spectral Count": "Spectral Count_A",
             "Unique Peptides": "Unique Peptides_A",
             "Confidence Score": "Confidence Score_A",
             "Log_Prob": "Log_Prob_A",
             "is_baf_core": "is_baf_core",
         }
     )
-    b = df_b.rename(
+    b = b.rename(
         columns={
-            "Spectral Count": "Spectral Count_B",
             "Unique Peptides": "Unique Peptides_B",
             "Confidence Score": "Confidence Score_B",
             "Log_Prob": "Log_Prob_B",
             "is_baf_core": "is_baf_core",
         }
     )
+    a["Spectral Count_A_raw"] = a_raw
+    a["Spectral Count_A"] = a_disp
+    b["Spectral Count_B_raw"] = b_raw
+    b["Spectral Count_B"] = b_disp
+    a = a.drop(columns=[c for c in ("Spectral Count",) if c in a.columns], errors="ignore")
+    b = b.drop(columns=[c for c in ("Spectral Count",) if c in b.columns], errors="ignore")
+
     merged = pd.merge(a, b, on="Gene Symbol", how="outer", suffixes=("", "_dup"))
 
-    # Determine category
-    has_a = merged["Spectral Count_A"].notna()
-    has_b = merged["Spectral Count_B"].notna()
+    has_a = merged["Spectral Count_A_raw"].fillna(0) > 0
+    has_b = merged["Spectral Count_B_raw"].fillna(0) > 0
     merged["category"] = np.where(has_a & has_b, "Both", np.where(has_a, "Only A", "Only B"))
 
-    # is_baf_core may appear in both; coalesce.
     if "is_baf_core_dup" in merged.columns:
         merged["is_baf_core"] = merged["is_baf_core"].fillna(merged["is_baf_core_dup"])
         merged = merged.drop(columns=["is_baf_core_dup"])
 
-    # Sort: Both first, then descending max spectral count.
     merged["max_spectral"] = merged[["Spectral Count_A", "Spectral Count_B"]].max(axis=1, skipna=True)
     merged = merged.sort_values(
         by=["category", "max_spectral", "Gene Symbol"],
@@ -534,6 +685,208 @@ def _comparison_table(df_a: pd.DataFrame, df_b: pd.DataFrame) -> pd.DataFrame:
     )
 
     return merged
+
+
+def _render_comparative_analytics_tab(
+    *,
+    selected_keys: list[str],
+    dataset_keys_all: list[str],
+    aggregated_by_file: dict[str, pd.DataFrame],
+    meta_by_file: dict[str, dict[str, Any]],
+) -> None:
+    if len(dataset_keys_all) < 2:
+        st.info("Upload at least two IP-MS CSVs under `/Data` to enable comparative analytics.")
+        return
+
+    sel = [str(k) for k in selected_keys if k in aggregated_by_file]
+    if len(sel) < 2:
+        st.info("In the sidebar, pick **two or more experiments** under **Comparative Analytics**.")
+        return
+
+    st.markdown(
+        "Compare enrichment across runs. **Two** selections → side-by-side volcanoes and an overlap table; "
+        "**three or more** → correlation heatmap of spectral profiles."
+    )
+    r1, r2 = st.columns(2)
+    with r1:
+        normalize = st.toggle(
+            "Total spectral-count normalization (PPM)",
+            value=True,
+            key="cmp_normalize_total",
+            help="Scale each run so total spectral counts sum to 1e6, comparable MS depth across experiments.",
+        )
+    with r2:
+        baf_only = st.toggle(
+            "Show only BAF subunits",
+            value=False,
+            key="cmp_baf_only",
+            help="Restrict the overlap table to BAF members; dim non-BAF points in volcanoes; heatmap uses BAF genes only.",
+        )
+
+    st.markdown("#### Selected experiments")
+    per_row = 4
+    for start in range(0, len(sel), per_row):
+        chunk = sel[start : start + per_row]
+        cols = st.columns(len(chunk))
+        for ci, fk in enumerate(chunk):
+            m = meta_by_file.get(fk, {})
+            with cols[ci]:
+                st.markdown(f"**{_short_dataset_label(fk, m, max_len=44)}**")
+                st.caption(
+                    f"**Investigator:** {m.get('investigator') or '—'}  \n"
+                    f"**Session:** {m.get('session_id') or '—'}  \n"
+                    f"**Bait:** {m.get('bait') or '—'}  \n"
+                    f"**Label:** {m.get('label') or '—'}"
+                )
+
+    if len(sel) == 2:
+        k_a, k_b = sel[0], sel[1]
+        df_a = aggregated_by_file[k_a]
+        df_b = aggregated_by_file[k_b]
+        lab_a = _short_dataset_label(k_a, meta_by_file.get(k_a, {}))
+        lab_b = _short_dataset_label(k_b, meta_by_file.get(k_b, {}))
+        bait_a = _infer_bait_gene_for_volcano(meta_by_file.get(k_a, {}))
+        bait_b = _infer_bait_gene_for_volcano(meta_by_file.get(k_b, {}))
+
+        use_log_x, xr, yr = _volcano_xy_limits_for_compare(df_a, df_b, normalize_total=normalize)
+
+        xt = (
+            "Spectral signal (PPM, log scale)"
+            if normalize and use_log_x
+            else "Spectral signal (PPM)"
+            if normalize
+            else "Spectral Count (log scale)"
+            if use_log_x
+            else "Spectral Count"
+        )
+
+        va = _normalize_total_spectral_column(df_a) if normalize else df_a.copy()
+        vb = _normalize_total_spectral_column(df_b) if normalize else df_b.copy()
+
+        st.markdown("#### Side-by-side volcano plots (matched axes)")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption(f"{lab_a}")
+            fig_a = _make_volcano_figure(
+                va,
+                bait_gene=bait_a,
+                force_log_x=use_log_x,
+                xaxis_range=xr,
+                yaxis_range=yr,
+                emphasize_baf_only=baf_only,
+                xaxis_title=xt,
+            )
+            st.plotly_chart(
+                fig_a,
+                use_container_width=True,
+                key=f"cmpv_a_{k_a}_{k_b}_{int(normalize)}_{int(baf_only)}",
+            )
+        with c2:
+            st.caption(f"{lab_b}")
+            fig_b = _make_volcano_figure(
+                vb,
+                bait_gene=bait_b,
+                force_log_x=use_log_x,
+                xaxis_range=xr,
+                yaxis_range=yr,
+                emphasize_baf_only=baf_only,
+                xaxis_title=xt,
+            )
+            st.plotly_chart(
+                fig_b,
+                use_container_width=True,
+                key=f"cmpv_b_{k_a}_{k_b}_{int(normalize)}_{int(baf_only)}",
+            )
+
+        st.markdown("#### Overlap / unique interactors")
+        if normalize:
+            st.caption(
+                "Spectral columns show **PPM** (normalized); **Common vs unique** is still defined by raw detection (spectral count > 0 in that run)."
+            )
+
+        try:
+            merged = _comparison_table(df_a, df_b, normalize_total=normalize)
+        except Exception as e:
+            st.error(f"Could not build comparison table: {e}")
+            return
+
+        if merged.empty or "category" not in merged.columns:
+            st.warning("No overlap rows were produced for this pair.")
+            return
+
+        overlap_n = int((merged["category"] == "Both").sum())
+        only_a_n = int((merged["category"] == "Only A").sum())
+        only_b_n = int((merged["category"] == "Only B").sum())
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Common interactors", overlap_n)
+        m2.metric(f"Unique to {lab_a}", only_a_n)
+        m3.metric(f"Unique to {lab_b}", only_b_n)
+
+        sp_lbl = "Spectral (PPM)" if normalize else "Spectral Count"
+        show_cols = [
+            "Gene Symbol",
+            "category",
+            "Spectral Count_A",
+            "Spectral Count_B",
+            "Unique Peptides_A",
+            "Unique Peptides_B",
+            "Confidence Score_A",
+            "Confidence Score_B",
+            "is_baf_core",
+        ]
+        use_show = [c for c in show_cols if c in merged.columns]
+        df_cmp = merged[use_show].copy()
+        df_cmp["is_baf_core"] = df_cmp["is_baf_core"].fillna(False)
+        df_cmp["_cat_ord"] = df_cmp["category"].map({"Both": 0, "Only A": 1, "Only B": 2}).fillna(3)
+        df_cmp = df_cmp.sort_values(
+            by=["is_baf_core", "_cat_ord", "Spectral Count_A", "Spectral Count_B"],
+            ascending=[False, True, False, False],
+            kind="mergesort",
+        )
+        df_cmp["Overlap group"] = df_cmp["category"].map(
+            {
+                "Both": "Common interactors",
+                "Only A": f"Unique to {lab_a}",
+                "Only B": f"Unique to {lab_b}",
+            }
+        )
+        df_cmp = df_cmp.drop(columns=["category", "_cat_ord"])
+        col_a = f"{lab_a} — {sp_lbl}"
+        col_b = f"{lab_b} — {sp_lbl}"
+        df_cmp = df_cmp.rename(columns={"Spectral Count_A": col_a, "Spectral Count_B": col_b})
+        front = ["Gene Symbol", "Overlap group", col_a, col_b]
+        rest = [c for c in df_cmp.columns if c not in front]
+        df_cmp = df_cmp[front + rest]
+
+        if baf_only:
+            df_cmp = df_cmp[df_cmp["is_baf_core"] == True]
+            if df_cmp.empty:
+                st.info("No BAF subunits in overlap table for this pair (try turning the filter off).")
+
+        if not df_cmp.empty:
+            st.dataframe(
+                _styled_gene_table(df_cmp),
+                use_container_width=True,
+                height=min(560, 120 + 22 * min(len(df_cmp), 80)),
+            )
+
+    else:
+        st.markdown("#### Spectral-count correlation heatmap")
+        st.caption(
+            "Pearson **r** on **log(1 + spectral counts)** per gene across runs (high r → similar spectral profiles)."
+        )
+        fig_h = _correlation_heatmap_spectral(
+            sel,
+            aggregated_by_file,
+            meta_by_file,
+            normalize_total=normalize,
+            baf_genes_only=baf_only,
+        )
+        st.plotly_chart(
+            fig_h,
+            use_container_width=True,
+            key=f"cmp_corr_{abs(hash(tuple(sel)))}_{int(normalize)}_{int(baf_only)}",
+        )
 
 
 def _dataset_appearance_for_subunit(df_gene: pd.DataFrame, subunit: str) -> bool:
@@ -1069,14 +1422,13 @@ def main() -> None:
                     st.rerun()
 
         st.markdown("---")
-        st.markdown("### Multi-Compare (2–4)")
+        st.markdown("### Comparative Analytics")
         st.multiselect(
-            "Experiments for scatter matrix",
+            "Experiments to compare (select ≥2)",
             options=dataset_keys_all,
             format_func=lambda kk: labels.get(kk, kk),
-            key="multi_compare_pick",
-            max_selections=4,
-            help="Select 2–4 runs, then open the **Multi-Experiment Compare** tab.",
+            key="compare_analytics_pick",
+            help="Two runs → **Comparative Analytics** tab shows side-by-side volcanoes + overlap table. Three or more → correlation heatmap.",
         )
 
         st.markdown("---")
@@ -1137,14 +1489,13 @@ def main() -> None:
 
     bait_gene_for_volcano = _infer_bait_gene_for_volcano(meta_by_file.get(selected_dataset, {}))
 
-    tab_main, tab_cmp, tab_vault, tab_global, tab_batch, tab_multi = st.tabs(
+    tab_main, tab_compare, tab_vault, tab_global, tab_batch = st.tabs(
         [
             "Main Dashboard",
-            "Comparison Mode",
+            "Comparative Analytics",
             "Data Vault",
             "Global Search",
             "Batch Subunit (Consensus)",
-            "Multi-Experiment Compare",
         ]
     )
 
@@ -1219,78 +1570,13 @@ def main() -> None:
             key="download_main_active",
         )
 
-    with tab_cmp:
-        st.markdown("### Dataset Comparison (Overlap vs Unique Interactors)")
-        ds_options = dataset_keys_all
-        if len(ds_options) < 2:
-            st.info("Comparison needs at least two datasets in `/Data`.")
-            return
-
-        idx_a = ds_options.index(selected_dataset) if selected_dataset in ds_options else 0
-        idx_b = 1 if len(ds_options) > 1 else 0
-
-        colA, colB = st.columns(2)
-        with colA:
-            dataset_a = st.selectbox("Dataset A", options=ds_options, index=idx_a)
-        with colB:
-            dataset_b = st.selectbox("Dataset B", options=ds_options, index=idx_b if idx_b != idx_a else 0)
-
-        try:
-            if dataset_a not in aggregated_by_file or dataset_b not in aggregated_by_file:
-                st.error("Comparison failed: one or both selected datasets could not be loaded.")
-                return
-
-            df_a = aggregated_by_file[dataset_a]
-            df_b = aggregated_by_file[dataset_b]
-            merged = _comparison_table(df_a, df_b)
-            if merged.empty or "category" not in merged.columns:
-                st.error("Comparison failed: overlap categories were not generated.")
-                return
-
-            overlap = int((merged["category"] == "Both").sum())
-            only_a = int((merged["category"] == "Only A").sum())
-            only_b = int((merged["category"] == "Only B").sum())
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Overlapping Interactors", f"{overlap}")
-            m2.metric("Unique to A", f"{only_a}")
-            m3.metric("Unique to B", f"{only_b}")
-
-            show_cols = [
-                "Gene Symbol",
-                "category",
-                "Spectral Count_A",
-                "Spectral Count_B",
-                "Unique Peptides_A",
-                "Unique Peptides_B",
-                "Confidence Score_A",
-                "Confidence Score_B",
-                "is_baf_core",
-            ]
-            df_cmp = merged[show_cols].copy()
-            df_cmp = df_cmp.rename(columns={"category": "Overlap Category"})
-            df_cmp["is_baf_core"] = df_cmp["is_baf_core"].fillna(False)
-            df_cmp = df_cmp.sort_values(
-                by=["is_baf_core", "Overlap Category", "Spectral Count_A", "Spectral Count_B"],
-                ascending=[False, True, False, False],
-                kind="mergesort",
-            )
-
-            styler_cmp = _styled_gene_table(df_cmp)
-            st.dataframe(styler_cmp, use_container_width=True, height=560)
-
-            # Optional: show a small summary for BAF-core overlap categories.
-            st.markdown("### BAF Core Emphasis")
-            core_only = df_cmp[df_cmp["is_baf_core"] == True]
-            if not core_only.empty and "Overlap Category" in core_only.columns:
-                core_counts = core_only["Overlap Category"].value_counts().to_dict()
-                st.write(core_counts)
-            elif not core_only.empty:
-                st.caption("BAF-core genes found, but overlap category values are unavailable.")
-            else:
-                st.caption("No BAF-core genes found in either dataset.")
-        except Exception as e:
-            st.error(f"Comparison failed: unable to compute overlap for the selected datasets. Details: {e}")
+    with tab_compare:
+        _render_comparative_analytics_tab(
+            selected_keys=list(st.session_state.get("compare_analytics_pick", [])),
+            dataset_keys_all=dataset_keys_all,
+            aggregated_by_file=aggregated_by_file,
+            meta_by_file=meta_by_file,
+        )
 
     with tab_vault:
         _render_data_vault_tab(
@@ -1422,19 +1708,6 @@ def main() -> None:
                         mime="text/csv",
                         key="download_consensus_batch",
                     )
-
-    with tab_multi:
-        st.markdown("### Multi-Experiment Comparison (Scatter Matrix)")
-        sel = [str(x) for x in st.session_state.get("multi_compare_pick", [])]
-        if len(sel) < 2:
-            st.info("In the sidebar, select **2–4 experiments** under **Multi-Compare**.")
-        elif len(sel) > 4:
-            st.warning("Please choose at most 4 experiments in the sidebar.")
-        else:
-            st.plotly_chart(
-                _scatter_matrix_spectral(sel, aggregated_by_file, meta_by_file),
-                use_container_width=True,
-            )
 
 
 if __name__ == "__main__":
