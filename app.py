@@ -25,6 +25,9 @@ DATA_SOURCE_DIR_DEFAULT = "/Users/sp1665/Downloads/IPMS/Janet_Liu"
 PROJECT_ROOT = os.path.dirname(__file__)
 DATA_EMPTY_MESSAGE = "No datasets found in /Data. Please add IP-MS CSVs to begin analysis."
 DATA_ROOT = pathlib.Path(__file__).parent.resolve() / "Data"
+# Avoid StreamlitAPIException: never assign to portal_dataset_select after its widget is created;
+# set this before the main selectbox runs, then pop and apply.
+_PENDING_PORTAL_DATASET_KEY = "_pending_portal_dataset"
 CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
 
 
@@ -640,8 +643,7 @@ def _render_global_search_tab(
         ds_id = r.get("Dataset ID", fk)
         label = f"Open **{ds_id}**"
         if st.button(label, key=f"global_open_{fk}_{i}"):
-            st.session_state["portal_project_view"] = "All Experiments"
-            st.session_state["portal_dataset_select"] = fk
+            st.session_state[_PENDING_PORTAL_DATASET_KEY] = str(fk)
             st.rerun()
 
 
@@ -937,10 +939,17 @@ def main() -> None:
 
         st.markdown("---")
         st.markdown("### Dataset Browser")
-        experiments_df, aggregated_by_file, meta_by_file, skipped_files = load_portal_data(
-            str(data_dir),
-            st.session_state["data_refresh_token"],
-        )
+        try:
+            experiments_df, aggregated_by_file, meta_by_file, skipped_files = load_portal_data(
+                str(data_dir),
+                st.session_state["data_refresh_token"],
+            )
+        except Exception as e:
+            st.error(
+                "Could not load experiment library. One or more files may be corrupted or unreadable. "
+                f"Details: {e}"
+            )
+            st.stop()
 
         if experiments_df.empty:
             st.warning("No CSV datasets were parsed successfully. Please check CSV format/headers.")
@@ -952,6 +961,15 @@ def main() -> None:
         dataset_keys_all = experiments_df["file_key"].astype(str).tolist()
         meta_lookup = meta_by_file
         labels = {k: _pretty_dataset_label(k, meta_lookup.get(k, {})) for k in dataset_keys_all}
+
+        # Apply investigator / global-search "set active" before portal_dataset_select widget is created.
+        if _PENDING_PORTAL_DATASET_KEY in st.session_state:
+            pending_fk = st.session_state.pop(_PENDING_PORTAL_DATASET_KEY)
+            if pending_fk and str(pending_fk) in dataset_keys_all:
+                st.session_state["portal_project_view"] = "All Experiments"
+                st.session_state["portal_dataset_select"] = str(pending_fk)
+            elif pending_fk:
+                st.warning(f"Could not switch active dataset (not in library): {pending_fk!r}")
 
         # Bait-based project grouping for active experiments.
         current_project_keys = [
@@ -1006,8 +1024,7 @@ def main() -> None:
                     format_func=lambda kk: labels.get(kk, kk),
                 )
                 if st.button("Set as active dataset", key=f"inv_set_{safe}", type="primary"):
-                    st.session_state["portal_dataset_select"] = pick
-                    st.session_state["portal_project_view"] = "All Experiments"
+                    st.session_state[_PENDING_PORTAL_DATASET_KEY] = str(pick)
                     st.rerun()
 
         st.markdown("---")
@@ -1060,7 +1077,16 @@ def main() -> None:
     else:
         selected_dataset = str(st.session_state.get("portal_dataset_select", dataset_keys_all[0]))
 
-    df_gene = aggregated_by_file[selected_dataset]
+    try:
+        df_gene = aggregated_by_file[selected_dataset]
+    except KeyError:
+        st.error(
+            f"Selected dataset is not available: {selected_dataset!r}. Choose another run in the sidebar."
+        )
+        st.stop()
+    except Exception as e:
+        st.error(f"Failed to load data for the selected experiment. Details: {e}")
+        st.stop()
 
     tab_main, tab_cmp, tab_vault, tab_global, tab_batch, tab_multi = st.tabs(
         [
