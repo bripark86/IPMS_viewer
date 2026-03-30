@@ -36,6 +36,10 @@ ACTIVE_DATASET_STATE_KEY = "active_dataset_id"
 ACTIVE_DF_STATE_KEY = "active_df"
 _DATASET_SWITCH_RERUN_KEY = "_dataset_switch_rerun"
 CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
+# Horizontal reference line on volcano: y = -log10(p); change here or wire to UI later.
+VOLCANO_CONFIDENCE_P_CUTOFF = 0.05
+# Subtle prey points (non-BAF); BAF uses BAF_CORE_COLOR (#FF4B4B).
+VOLCANO_PREY_COLOR = "#5C6E82"
 
 
 def _apply_global_css() -> None:
@@ -280,6 +284,13 @@ def load_portal_data(
     return experiments_df, aggregated_by_file, meta_by_file, skipped_files
 
 
+def _stem_from_meta_filename(filename: str | None) -> str | None:
+    fn = str(filename or "").strip()
+    if not fn:
+        return None
+    return fn[: -len(".csv")] if fn.lower().endswith(".csv") else fn
+
+
 def _infer_bait_gene_for_volcano(meta: dict[str, Any]) -> str | None:
     """Gene symbol for bait marker (diamond). Returns None if not inferable (e.g. EV only)."""
     bait_raw = str(meta.get("bait") or "").strip()
@@ -287,7 +298,7 @@ def _infer_bait_gene_for_volcano(meta: dict[str, Any]) -> str | None:
         m = re.match(r"^([A-Za-z0-9]+)", bait_raw)
         if m:
             return m.group(1).upper()
-    ig = infer_bait_gene_from_label(meta.get("label"))
+    ig = infer_bait_gene_from_label(meta.get("label"), _stem_from_meta_filename(meta.get("filename")))
     return ig.upper() if ig else None
 
 
@@ -335,12 +346,13 @@ def _make_volcano_figure(
     yaxis_range: tuple[float, float] | None = None,
     emphasize_baf_only: bool = False,
     xaxis_title: str | None = None,
+    confidence_p_threshold: float | None = VOLCANO_CONFIDENCE_P_CUTOFF,
 ) -> go.Figure:
     """
-    Volcano: X = Spectral Count (abundance proxy), Y = -log10(LDA probability).
-    BAF subunits: red circles. Bait: diamond. If emphasize_baf_only, dim non-BAF preys.
+    Volcano: X = Spectral Count (abundance), Y = -log10(LDA probability).
+    BAF subunits (26): #FF4B4B. Other prey: muted blue-grey. Optional dashed p-cutoff line.
     """
-    base_color = "#00A6ED"
+    prey_color = VOLCANO_PREY_COLOR
     core_color = BAF_CORE_COLOR
     bait_non_baf_color = "#FFD700"
 
@@ -395,12 +407,13 @@ def _make_volcano_figure(
     ) -> None:
         if d.empty:
             return
-        opacity = 0.14 if prey_dimmed else 0.9
+        opacity = 0.14 if prey_dimmed else 0.82
+        line_col = "rgba(255,255,255,0.35)" if prey_dimmed else "rgba(57, 71, 91, 0.65)"
         mk: dict[str, Any] = dict(
             size=size,
             color=color,
             opacity=opacity,
-            line=dict(width=0.5, color="#FFFFFF"),
+            line=dict(width=0.5, color=line_col),
         )
         if symbol:
             mk["symbol"] = symbol
@@ -416,22 +429,20 @@ def _make_volcano_figure(
                         d["Gene Symbol"].astype(str).values,
                         d["Unique Peptides"].values,
                         d["Spectral Count"].values,
-                        d["Log_Prob"].values,
                     ],
                     axis=-1,
                 ),
                 hovertemplate=(
                     "<b>%{customdata[0]}</b><br>"
-                    "Spectral Count: %{customdata[2]}<br>"
-                    "Unique Peptides: %{customdata[1]}<br>"
-                    "-log10(LDA prob): %{customdata[3]:.4f}<br>"
+                    "Spectral count: %{customdata[2]}<br>"
+                    "Unique peptides: %{customdata[1]}<br>"
                     "<extra></extra>"
                 ),
             )
         )
 
     prey_dim = bool(emphasize_baf_only)
-    _scatter_trace(df_prey, name="Prey / other", color=base_color, size=7, symbol=None, prey_dimmed=prey_dim)
+    _scatter_trace(df_prey, name="Prey / other", color=prey_color, size=7, symbol=None, prey_dimmed=prey_dim)
     _scatter_trace(df_baf_circle, name="BAF core (26)", color=core_color, size=12, symbol=None)
 
     if bait_u and not df_bait.empty:
@@ -469,6 +480,23 @@ def _make_volcano_figure(
         yaxis=yaxis_cfg,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+
+    if (
+        confidence_p_threshold is not None
+        and 0.0 < float(confidence_p_threshold) < 1.0
+        and not df.empty
+    ):
+        y_cut = float(-np.log10(float(confidence_p_threshold)))
+        fig.add_hline(
+            y=y_cut,
+            line_dash="dash",
+            line_color="rgba(230, 237, 243, 0.5)",
+            line_width=1,
+            annotation_text=f"p = {float(confidence_p_threshold):g}",
+            annotation_position="right",
+            annotation_font_size=11,
+            annotation_font_color="rgba(230, 237, 243, 0.9)",
+        )
     return fig
 
 
@@ -606,11 +634,19 @@ def _correlation_heatmap_spectral(
 
 
 def draw_volcano_plot(
-    active_dataset_id: str, active_dataset: pd.DataFrame, *, bait_gene: str | None
+    active_dataset_id: str,
+    active_dataset: pd.DataFrame,
+    *,
+    bait_gene: str | None,
+    confidence_p_threshold: float | None = VOLCANO_CONFIDENCE_P_CUTOFF,
 ) -> go.Figure:
     """Not cached: must redraw when `active_dataset_id` or frame changes (cache caused stale plots)."""
     _ = active_dataset_id
-    return _make_volcano_figure(active_dataset, bait_gene=bait_gene)
+    return _make_volcano_figure(
+        active_dataset,
+        bait_gene=bait_gene,
+        confidence_p_threshold=confidence_p_threshold,
+    )
 
 
 def draw_complex_coverage(active_dataset_id: str, active_dataset: pd.DataFrame) -> go.Figure:

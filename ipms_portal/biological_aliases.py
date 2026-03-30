@@ -66,14 +66,18 @@ def resolve_biological_fields(
     return bio, domain, display
 
 
-def infer_bait_gene_from_label(label: str | None) -> Optional[str]:
+def infer_bait_gene_from_label(label: str | None, stem: str | None = None) -> Optional[str]:
     """
-    Heuristic: find a known BAF subunit token inside the sample label.
+    Heuristic: find a known BAF subunit token in the sample label and/or filename stem
+    (e.g. SMARCA4 in the file name when the parsed label omits it).
     """
-    if not label:
-        return None
-    for tok in str(label).replace("-", "_").split("_"):
+    tokens: list[str] = []
+    if label:
+        tokens.extend(str(label).replace("-", "_").split("_"))
+    if stem:
+        tokens.extend(str(stem).replace("-", "_").split("_"))
+    for tok in tokens:
         t = tok.strip().upper()
-        if t in BAF_SUBUNIT_SET:
+        if t and t in BAF_SUBUNIT_SET:
             return t
     return None

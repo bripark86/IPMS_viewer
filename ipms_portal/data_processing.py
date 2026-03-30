@@ -119,23 +119,29 @@ def _select_and_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df2
 
 
-def _peptide_lda_prob_column(df: pd.DataFrame) -> pd.Series:
+def _peptide_lda_prob_numeric(df: pd.DataFrame) -> pd.Series:
     """
-    Numeric LDA probability per peptide row: non-numeric / empty -> 1.0 (uninformative prior).
-    Values in (1, 100] treated as percents. Clipped to (0, 1].
+    Per-peptide LDA probability: coerce with pd.to_numeric(..., errors='coerce').
+    Missing / non-numeric / out-of-range values stay NaN (no floor, no fill)—those rows
+    do not contribute valid probability mass at gene aggregation time.
+    Values in (1, 100] are treated as percents and scaled to (0, 1].
     """
     if "LDA Probability" not in df.columns:
-        return pd.Series(1.0, index=df.index, dtype=float)
+        return pd.Series(np.nan, index=df.index, dtype=float)
 
-    s = df["LDA Probability"].astype(str).str.strip()
-    u = s.str.upper()
-    bad = u.isin(["", "N/A", "NA", "NAN", "NONE", "NULL", "-", "—"])
-    s = s.where(~bad, np.nan)
-    lda = pd.to_numeric(s, errors="coerce").fillna(1.0).astype(float)
-    pct = (lda > 1.0) & (lda <= 100.0)
+    raw = df["LDA Probability"]
+    if raw.dtype == object or str(raw.dtype) == "string":
+        s = raw.astype(str).str.strip()
+        u = s.str.upper()
+        bad = u.isin(["", "N/A", "NA", "NAN", "NONE", "NULL", "-", "—"])
+        s = s.where(~bad, np.nan)
+        lda = pd.to_numeric(s, errors="coerce")
+    else:
+        lda = pd.to_numeric(raw, errors="coerce")
+    lda = lda.astype(float)
+    pct = lda.notna() & (lda > 1.0) & (lda <= 100.0)
     lda = lda.where(~pct, lda / 100.0)
-    lda = lda.where(lda <= 1.0, 1.0)
-    lda = lda.clip(lower=1e-15, upper=1.0)
+    lda = lda.where(lda.notna() & (lda > 0.0) & (lda <= 1.0), np.nan)
     return lda
 
 
@@ -158,7 +164,7 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
     df["Gene Symbol"] = df["Gene Symbol"].astype(str).str.strip()
     df["Peptide"] = df["Peptide"].astype(str).str.strip()
 
-    df["LDA_Prob"] = _peptide_lda_prob_column(df)
+    df["LDA_Prob"] = _peptide_lda_prob_numeric(df)
 
     grouped = df.groupby("Gene Symbol", dropna=False, sort=False)
     spectral_count = grouped.size().rename("Spectral Count")
@@ -166,9 +172,11 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
     avg_lda = grouped["LDA_Prob"].mean().rename("Confidence Score")
 
     out = pd.concat([spectral_count, unique_peptides, avg_lda], axis=1).reset_index()
-    cs = pd.to_numeric(out["Confidence Score"], errors="coerce").fillna(1.0).clip(lower=1e-15, upper=1.0)
+    cs = pd.to_numeric(out["Confidence Score"], errors="coerce")
     out["Confidence Score"] = cs
-    out["Log_Prob"] = -np.log10(cs)
+    out["Log_Prob"] = np.nan
+    valid_p = cs.notna() & (cs > 0.0) & (cs <= 1.0)
+    out.loc[valid_p, "Log_Prob"] = -np.log10(cs.loc[valid_p])
 
     return out
 
@@ -209,11 +217,10 @@ def extract_metadata_from_filename(filename: str) -> tuple[Optional[str], Option
     Back-compat shim: approximate (cell_line, bait, replicate) from fuzzy label.
     May return Nones when not inferrable.
     """
-    stem = os.path.basename(filename)
-    if stem.lower().endswith(".csv"):
-        stem = stem[: -len(".csv")]
+    base = os.path.basename(filename)
+    stem = base[: -len(".csv")] if base.lower().endswith(".csv") else base
     _sid, _ini, label = parse_filename_fuzzy(stem)
-    bait = infer_bait_gene_from_label(label)
+    bait = infer_bait_gene_from_label(label, stem)
     cell = None
     if label:
         toks = label.split("_")
@@ -285,7 +292,7 @@ def enrich_meta_dict(meta: ExperimentMeta) -> dict[str, object]:
     inv_s = meta.investigator if meta.investigator else None
     label = meta.label or ""
     stem = meta.filename[: -len(".csv")] if meta.filename.lower().endswith(".csv") else meta.filename
-    bait_guess = infer_bait_gene_from_label(meta.label)
+    bait_guess = infer_bait_gene_from_label(meta.label, stem)
     bio, domain, disp_bait = resolve_biological_fields(meta.label, stem, bait_gene_guess=bait_guess)
 
     cell_line = None
@@ -314,8 +321,8 @@ def enrich_meta_dict(meta: ExperimentMeta) -> dict[str, object]:
 
 def add_baf_core_indicator(df_gene_level: pd.DataFrame, baf_subunits: list[str]) -> pd.DataFrame:
     df = df_gene_level.copy()
-    baf_set = set(baf_subunits)
-    df["is_baf_core"] = df["Gene Symbol"].isin(baf_set)
+    baf_set = {g.upper() for g in baf_subunits}
+    df["is_baf_core"] = df["Gene Symbol"].astype(str).str.strip().str.upper().isin(baf_set)
     return df
 
 
