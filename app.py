@@ -45,6 +45,9 @@ VOLCANO_PUB_GREY = "#9E9E9E"
 VOLCANO_PUB_RED = "#D62728"
 VOLCANO_PUB_BLUE = "#1F78B4"
 VOLCANO_PUB_BAIT = "#FDB462"
+# When using mean-spectral baseline (no Mock/EV), tiny IP lists make the mean unstable — use this constant instead.
+VOLCANO_MIN_GENES_FOR_MEAN_BASELINE = 8
+VOLCANO_MEAN_BASELINE_FALLBACK = 1.0
 
 
 def _apply_global_css() -> None:
@@ -250,6 +253,7 @@ def load_portal_data(
     for meta in metas:
         try:
             df_gene = load_and_aggregate_csv(meta.path)
+            lda_csv_ok = bool(df_gene.attrs.get("ipms_lda_probability_column_in_csv", True))
             df_gene = add_baf_core_indicator(df_gene, BAF_SUBUNITS)
             enriched = enrich_meta_dict(meta)
             df_gene = add_experiment_biological_columns(
@@ -257,7 +261,10 @@ def load_portal_data(
                 biological_target=str(enriched.get("biological_target", "N/A")),
                 domain_details=str(enriched.get("domain_details", "N/A")),
             )
+            df_gene.attrs["ipms_lda_probability_column_in_csv"] = lda_csv_ok
             aggregated_by_file[meta.file_key] = df_gene
+
+            meta_by_file[meta.file_key] = {**dict(enriched), "lda_probability_column_in_csv": lda_csv_ok}
 
             experiments_rows.append(
                 {
@@ -277,7 +284,6 @@ def load_portal_data(
                     "n_baf_core": int(df_gene["is_baf_core"].sum()),
                 }
             )
-            meta_by_file[meta.file_key] = dict(enriched)
         except Exception:
             skipped_files.append(meta.file_key)
             continue
@@ -364,14 +370,18 @@ def _auto_control_dataset_key(
 def _prepare_volcano_foldchange_frame(
     df_bait: pd.DataFrame,
     df_control: pd.DataFrame | None,
-) -> tuple[pd.DataFrame, str]:
+    *,
+    lda_column_present: bool = True,
+) -> tuple[pd.DataFrame, str, list[str]]:
     """
     Gene-level log2 fold change with +1 pseudocount:
     log2((bait_sc+1)/(control_sc+1)), or vs dataset mean spectral count if no control.
     """
+    diags: list[str] = []
     d = df_bait.copy()
     d["Gene Symbol"] = d["Gene Symbol"].astype(str).str.strip().str.upper()
     sc_b = pd.to_numeric(d["Spectral Count"], errors="coerce").fillna(0.0)
+    n_prot = int(len(sc_b))
     if df_control is not None and not df_control.empty:
         c = df_control.copy()
         c["Gene Symbol"] = c["Gene Symbol"].astype(str).str.strip().str.upper()
@@ -379,13 +389,120 @@ def _prepare_volcano_foldchange_frame(
         sc_m = d["Gene Symbol"].map(idx).fillna(0.0).astype(float)
         mode = "mock_ev"
     else:
-        mu = float(sc_b.mean()) if len(sc_b) else 0.0
+        if n_prot < VOLCANO_MIN_GENES_FOR_MEAN_BASELINE:
+            mu = float(VOLCANO_MEAN_BASELINE_FALLBACK)
+            diags.append(
+                f"**Baseline:** only **{n_prot}** proteins in this IP — using fixed baseline spectral count "
+                f"**{VOLCANO_MEAN_BASELINE_FALLBACK:g}** instead of the mean (fold-change stability)."
+            )
+        else:
+            mu = float(sc_b.mean()) if n_prot else 0.0
         sc_m = pd.Series(np.full(len(d), mu, dtype=float), index=d.index)
         mode = "mean_baseline"
     d["Log2FC"] = np.log2((sc_b.astype(float) + 1.0) / (sc_m + 1.0))
     d["Log_Prob"] = pd.to_numeric(d["Log_Prob"], errors="coerce")
+    n_before = len(d)
     d = d.dropna(subset=["Log_Prob"])
-    return d, mode
+    if d.empty and n_before > 0 and lda_column_present:
+        diags.append(
+            "**LDA signal:** every gene has missing or invalid **Log_Prob** after aggregation "
+            "(needs numeric LDA probability in (0, 1] at peptide level)."
+        )
+    return d, mode, diags
+
+
+def _make_discovery_volcano_figure(active_dataset: pd.DataFrame, *, bait_gene: str | None) -> go.Figure:
+    """Fallback: spectral count vs unique peptides when LDA / FC volcano has no valid y."""
+    d = active_dataset.copy()
+    d["Spectral Count"] = pd.to_numeric(d["Spectral Count"], errors="coerce")
+    if "Unique Peptides" not in d.columns:
+        d["Unique Peptides"] = 0.0
+    d["Unique Peptides"] = pd.to_numeric(d["Unique Peptides"], errors="coerce").fillna(0.0)
+    d = d.dropna(subset=["Spectral Count"])
+    d = d[d["Spectral Count"] > 0]
+
+    if d.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            title="Discovery view: no proteins with spectral count > 0",
+            margin=dict(l=56, r=36, t=48, b=48),
+        )
+        return fig
+
+    genes_u = d["Gene Symbol"].astype(str).str.strip().str.upper()
+    bait_u = bait_gene.strip().upper() if bait_gene else None
+    is_bait = genes_u == bait_u if bait_u else pd.Series(False, index=d.index)
+    has_baf = "is_baf_core" in d.columns
+
+    d_bait_only = d.loc[is_bait].copy()
+    d_rest = d.loc[~is_bait].copy()
+    if has_baf:
+        ib = d_rest["is_baf_core"] == True
+        d_baf_ring = d_rest.loc[ib]
+        d_prey = d_rest.loc[~ib]
+    else:
+        d_baf_ring = d_rest.iloc[0:0]
+        d_prey = d_rest
+
+    pos = d["Spectral Count"].astype(float)
+    use_log_x = len(pos) >= 3 and (float(pos.max()) > 80 or float(pos.max()) / max(float(pos.min()), 1.0) >= 25.0)
+
+    fig = go.Figure()
+
+    def _tr(sub: pd.DataFrame, *, name: str, color: str, size: int) -> None:
+        if sub.empty:
+            return
+        fig.add_trace(
+            go.Scatter(
+                x=sub["Spectral Count"],
+                y=sub["Unique Peptides"],
+                mode="markers",
+                name=name,
+                marker=dict(color=color, size=size, opacity=0.85, line=dict(width=0.35, color="rgba(0,0,0,0.2)")),
+                customdata=sub["Gene Symbol"].astype(str).values,
+                hovertemplate="<b>%{customdata}</b><br>Spectral count: %{x}<br>Unique peptides: %{y}<extra></extra>",
+            )
+        )
+
+    _tr(d_prey, name="Prey", color=VOLCANO_PUB_GREY, size=6)
+    _tr(d_baf_ring, name="BAF subunit", color=VOLCANO_PUB_RED, size=9)
+
+    if bait_u and not d_bait_only.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=d_bait_only["Spectral Count"],
+                y=d_bait_only["Unique Peptides"],
+                mode="markers",
+                name=f"Bait ({bait_u})",
+                marker=dict(
+                    size=15,
+                    color=VOLCANO_PUB_BAIT,
+                    symbol="diamond",
+                    line=dict(width=1, color="#333333"),
+                ),
+                customdata=d_bait_only["Gene Symbol"].astype(str).values,
+                hovertemplate="<b>%{customdata}</b> (bait)<br>Spectral count: %{x}<br>Unique peptides: %{y}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FAFAFA",
+        title=dict(text="Discovery view: spectral count vs unique peptides", font=dict(size=14)),
+        font=dict(color="#222222"),
+        margin=dict(l=56, r=36, t=56, b=48),
+        xaxis=dict(
+            title="Spectral count",
+            type="log" if use_log_x else "linear",
+            gridcolor="#E0E0E0",
+        ),
+        yaxis=dict(title="Unique peptides", gridcolor="#E0E0E0"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=480,
+    )
+    return fig
 
 
 def _make_publication_volcano_figure(
@@ -892,17 +1009,36 @@ def draw_volcano_plot(
     log2_fc_threshold: float,
     neg_log10_p_threshold: float,
     n_top_labels: int,
-) -> go.Figure:
-    """Publication-style FC volcano; baseline is Mock/EV (same folder) or mean spectral count."""
+    lda_column_present: bool = True,
+) -> tuple[go.Figure, list[str]]:
+    """Publication FC volcano when LDA is valid; otherwise discovery scatter (spectral × unique peptides)."""
     _ = active_dataset_id
-    df_fc, _mode = _prepare_volcano_foldchange_frame(active_dataset, df_baseline)
-    return _make_publication_volcano_figure(
+    msgs: list[str] = []
+    if not lda_column_present:
+        msgs.append(
+            "**Missing LDA Probability column in CSV** — `load_and_aggregate_csv` expects a resolvable header "
+            "such as `LDA Probability` with numeric values in **(0, 1]** (see `ipms_portal/data_processing.py`). "
+            "**Discovery view** is shown below (spectral count vs unique peptides)."
+        )
+    df_fc, _mode, prep_msgs = _prepare_volcano_foldchange_frame(
+        active_dataset, df_baseline, lda_column_present=lda_column_present
+    )
+    msgs.extend(prep_msgs)
+    if df_fc.empty:
+        if lda_column_present:
+            msgs.append(
+                "**No genes with valid LDA probability** — values may be missing, non-numeric, or outside (0, 1] "
+                "after gene-level aggregation. **Discovery view** is shown below."
+            )
+        return _make_discovery_volcano_figure(active_dataset, bait_gene=bait_gene), msgs
+    fig = _make_publication_volcano_figure(
         df_fc,
         bait_gene=bait_gene,
         log2_fc_threshold=log2_fc_threshold,
         neg_log10_p_threshold=neg_log10_p_threshold,
         n_top_labels=n_top_labels,
     )
+    return fig, msgs
 
 
 def draw_complex_coverage(active_dataset_id: str, active_dataset: pd.DataFrame) -> go.Figure:
@@ -1888,19 +2024,24 @@ def main() -> None:
         vol_fc_thr = float(st.session_state.get("volcano_fc_threshold", 1.5))
         vol_y_thr = float(st.session_state.get("volcano_neglog10_p", 2.0))
         vol_n_lbl = int(st.session_state.get("volcano_n_labels", 8))
+        lda_csv_ok = bool(meta_by_file.get(selected_dataset, {}).get("lda_probability_column_in_csv", True))
 
+        fig_volc, vol_msgs = draw_volcano_plot(
+            selected_dataset,
+            active_df,
+            bait_gene=bait_gene_for_volcano,
+            df_baseline=df_volc_baseline,
+            log2_fc_threshold=vol_fc_thr,
+            neg_log10_p_threshold=vol_y_thr,
+            n_top_labels=vol_n_lbl,
+            lda_column_present=lda_csv_ok,
+        )
+        if vol_msgs:
+            st.warning("\n\n".join(vol_msgs))
         st.plotly_chart(
-            draw_volcano_plot(
-                selected_dataset,
-                active_df,
-                bait_gene=bait_gene_for_volcano,
-                df_baseline=df_volc_baseline,
-                log2_fc_threshold=vol_fc_thr,
-                neg_log10_p_threshold=vol_y_thr,
-                n_top_labels=vol_n_lbl,
-            ),
+            fig_volc,
             use_container_width=True,
-            key=f"main_volcano_{selected_dataset}_{vol_fc_thr}_{vol_y_thr}_{vol_n_lbl}",
+            key=f"main_volcano_{selected_dataset}_{vol_fc_thr}_{vol_y_thr}_{vol_n_lbl}_{lda_csv_ok}",
         )
 
         st.markdown("### Complex Coverage (BAF Subunits Pulled Down)")

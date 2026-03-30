@@ -164,6 +164,7 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
     df["Gene Symbol"] = df["Gene Symbol"].astype(str).str.strip()
     df["Peptide"] = df["Peptide"].astype(str).str.strip()
 
+    lda_col_present = "LDA Probability" in df.columns
     df["LDA_Prob"] = _peptide_lda_prob_numeric(df)
 
     grouped = df.groupby("Gene Symbol", dropna=False, sort=False)
@@ -177,6 +178,8 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
     out["Log_Prob"] = np.nan
     valid_p = cs.notna() & (cs > 0.0) & (cs <= 1.0)
     out.loc[valid_p, "Log_Prob"] = -np.log10(cs.loc[valid_p])
+
+    out.attrs["ipms_lda_probability_column_in_csv"] = bool(lda_col_present)
 
     return out
 
