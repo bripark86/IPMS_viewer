@@ -155,7 +155,8 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
         if col_gene is not None
         else pd.Series([f"UNKNOWN_{i+1}" for i in range(n)], index=df_raw.index)
     )
-    gene = gene.replace({"": np.nan, "nan": np.nan, "None": np.nan}).fillna(
+    gene = gene.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    gene = gene.infer_objects(copy=False).fillna(
         pd.Series([f"UNKNOWN_{i+1}" for i in range(n)], index=df_raw.index)
     )
 
