@@ -233,26 +233,13 @@ def _styled_gene_table(df: pd.DataFrame) -> Any:
 
 @st.cache_data(show_spinner="Accessing BAF-Vault...")
 def process_csv(csv_path: str, csv_mtime: float) -> pd.DataFrame:
-    """Load pre-aggregated _PROCESSED.csv when fresh; else aggregate peptide->gene and persist."""
+    """Legacy shim: aggregate directly from source CSV (no _PROCESSED writes)."""
     _ = csv_mtime
-    p = pathlib.Path(csv_path)
-    processed = p.with_name(f"{p.stem}_PROCESSED.csv")
-
-    if processed.exists():
-        try:
-            pm = processed.stat().st_mtime
-            if pm >= float(csv_mtime):
-                d = pd.read_csv(processed)
-                if "Gene Symbol" in d.columns and "Spectral Count" in d.columns:
-                    d.attrs["ipms_lda_probability_column_in_csv"] = True
-                    return d
-        except Exception:
-            pass
-
     try:
-        d = load_and_aggregate_csv(str(p))
+        d = load_and_aggregate_csv(str(csv_path))
     except Exception:
         # permissive fallback keeps file searchable instead of skipping it entirely
+        p = pathlib.Path(csv_path)
         d = pd.DataFrame(
             {
                 "Gene Symbol": [p.stem.upper() or "UNKNOWN"],
@@ -263,10 +250,6 @@ def process_csv(csv_path: str, csv_mtime: float) -> pd.DataFrame:
             }
         )
         d.attrs["ipms_lda_probability_column_in_csv"] = False
-    try:
-        d.to_csv(processed, index=False)
-    except Exception:
-        pass
     return d
 
 
@@ -274,112 +257,114 @@ def process_csv(csv_path: str, csv_mtime: float) -> pd.DataFrame:
 def load_portal_data(
     data_dir: str,
     file_count: int,
-) -> tuple[pd.DataFrame, dict[str, dict[str, Any]], list[str]]:
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, dict[str, Any]], list[str], list[dict[str, str]]]:
     """
-    Fast crawl-only index (lazy loading):
-    - experiments_df: one row per CSV metadata
-    - meta_by_file: file_key -> metadata
-    - skipped_files: metadata parse failures
+    Robust eager loader: crawl and aggregate all CSV files so all tabs/search are immediately available.
     """
     _ = file_count
     data_root = os.path.abspath(os.path.normpath(data_dir))
-    print(f"[IPMS Debug] load_portal_data: crawling Data at {data_root!r} (file_count={file_count})")
+    print(f"[IPMS Debug] load_portal_data: scanning Data at {data_root!r} (file_count={file_count})")
     metas = scan_csv_files(data_root)
 
     experiments_rows: list[dict[str, Any]] = []
+    aggregated_by_file: dict[str, pd.DataFrame] = {}
     meta_by_file: dict[str, dict[str, Any]] = {}
     skipped_files: list[str] = []
+    parsing_errors: list[dict[str, str]] = []
 
     for meta in metas:
         try:
+            df_gene = load_and_aggregate_csv(meta.path)
+            lda_csv_ok = bool(df_gene.attrs.get("ipms_lda_probability_column_in_csv", True))
+            df_gene = add_baf_core_indicator(df_gene, BAF_SUBUNITS)
             enriched = enrich_meta_dict(meta)
-            meta_by_file[meta.file_key] = dict(enriched)
+            df_gene = add_experiment_biological_columns(
+                df_gene,
+                biological_target=str(enriched.get("biological_target", "Unknown")),
+                domain_details=str(enriched.get("domain_details", "Unknown")),
+            )
+            df_gene.attrs["ipms_lda_probability_column_in_csv"] = lda_csv_ok
+            aggregated_by_file[meta.file_key] = df_gene
+            meta_by_file[meta.file_key] = {**dict(enriched), "lda_probability_column_in_csv": lda_csv_ok}
             experiments_rows.append(
                 {
                     "file_key": meta.file_key,
                     "filename": meta.filename,
-                    "investigator": enriched.get("investigator"),
-                    "session_id": enriched.get("session_id"),
-                    "initials": enriched.get("initials"),
-                    "label": enriched.get("label"),
-                    "cell_line": enriched.get("cell_line"),
-                    "bait": enriched.get("bait"),
-                    "biological_target": enriched.get("biological_target"),
-                    "domain_details": enriched.get("domain_details"),
+                    "investigator": enriched.get("investigator") or "Unknown",
+                    "session_id": enriched.get("session_id") or "Unknown",
+                    "initials": enriched.get("initials") or "Unknown",
+                    "label": enriched.get("label") or "Unknown",
+                    "cell_line": enriched.get("cell_line") or "Unknown",
+                    "bait": enriched.get("bait") or "Unknown",
+                    "biological_target": enriched.get("biological_target") or "Unknown",
+                    "domain_details": enriched.get("domain_details") or "Unknown",
                     "mtime": meta.mtime,
-                    "path": enriched.get("path"),
+                    "path": enriched.get("path") or meta.path,
+                    "n_proteins": int(df_gene["Gene Symbol"].nunique()),
+                    "n_baf_core": int(df_gene["is_baf_core"].sum()),
                 }
             )
-        except Exception:
+        except Exception as e:
             skipped_files.append(meta.file_key)
-            continue
+            parsing_errors.append({"file": meta.file_key, "reason": str(e) or "Unknown parse error"})
+            # permissive fallback: keep file visible/searchable
+            try:
+                enriched = enrich_meta_dict(meta)
+            except Exception:
+                enriched = {
+                    "investigator": meta.investigator or "Unknown",
+                    "session_id": meta.session_id or "Unknown",
+                    "initials": meta.initials or "Unknown",
+                    "label": meta.label or "Unknown",
+                    "cell_line": "Unknown",
+                    "bait": "Unknown",
+                    "biological_target": "Unknown",
+                    "domain_details": "Unknown",
+                    "path": meta.path,
+                    "filename": meta.filename,
+                }
+            d = pd.DataFrame(
+                {
+                    "Gene Symbol": [str(meta.filename).replace('.csv', '') or "UNKNOWN"],
+                    "Spectral Count": [1.0],
+                    "Unique Peptides": [1],
+                    "Confidence Score": [0.5],
+                    "Log_Prob": [-np.log10(0.5)],
+                }
+            )
+            d = add_baf_core_indicator(d, BAF_SUBUNITS)
+            d = add_experiment_biological_columns(
+                d,
+                biological_target=str(enriched.get("biological_target", "Unknown")),
+                domain_details=str(enriched.get("domain_details", "Unknown")),
+            )
+            d.attrs["ipms_lda_probability_column_in_csv"] = False
+            aggregated_by_file[meta.file_key] = d
+            meta_by_file[meta.file_key] = {**dict(enriched), "lda_probability_column_in_csv": False}
+            experiments_rows.append(
+                {
+                    "file_key": meta.file_key,
+                    "filename": meta.filename,
+                    "investigator": enriched.get("investigator") or "Unknown",
+                    "session_id": enriched.get("session_id") or "Unknown",
+                    "initials": enriched.get("initials") or "Unknown",
+                    "label": enriched.get("label") or "Unknown",
+                    "cell_line": enriched.get("cell_line") or "Unknown",
+                    "bait": enriched.get("bait") or "Unknown",
+                    "biological_target": enriched.get("biological_target") or "Unknown",
+                    "domain_details": enriched.get("domain_details") or "Unknown",
+                    "mtime": meta.mtime,
+                    "path": enriched.get("path") or meta.path,
+                    "n_proteins": int(d["Gene Symbol"].nunique()),
+                    "n_baf_core": int(d["is_baf_core"].sum()),
+                }
+            )
 
     experiments_df = pd.DataFrame(experiments_rows)
     if not experiments_df.empty and "mtime" in experiments_df.columns:
         experiments_df = experiments_df.sort_values("mtime", ascending=False).reset_index(drop=True)
 
-    return experiments_df, meta_by_file, skipped_files
-
-
-@st.cache_data(show_spinner="Accessing BAF-Vault...")
-def load_dataset_frame(
-    csv_path: str,
-    csv_mtime: float,
-    biological_target: str,
-    domain_details: str,
-) -> pd.DataFrame:
-    """On-demand heavy parser for a single CSV."""
-    _ = csv_mtime
-    d = load_and_aggregate_csv(csv_path)
-    d = add_baf_core_indicator(d, BAF_SUBUNITS)
-    d = add_experiment_biological_columns(
-        d,
-        biological_target=str(biological_target or "Unknown"),
-        domain_details=str(domain_details or "Unknown"),
-    )
-    return d
-
-
-def _get_dataset_df(
-    file_key: str,
-    *,
-    meta_by_file: dict[str, dict[str, Any]],
-) -> pd.DataFrame:
-    m = meta_by_file.get(file_key, {})
-    csv_path = str(m.get("path") or "")
-    if not csv_path:
-        return pd.DataFrame(
-            {
-                "Gene Symbol": [str(file_key).replace(".csv", "")],
-                "Spectral Count": [1.0],
-                "Unique Peptides": [1],
-                "Confidence Score": [0.5],
-                "Log_Prob": [-np.log10(0.5)],
-                "is_baf_core": [False],
-                "Biological Target": [str(m.get("biological_target") or "Unknown")],
-                "Domain/Details": [str(m.get("domain_details") or "Unknown")],
-            }
-        )
-    try:
-        return load_dataset_frame(
-            csv_path,
-            float(m.get("mtime", 0.0) or 0.0),
-            str(m.get("biological_target") or "Unknown"),
-            str(m.get("domain_details") or "Unknown"),
-        )
-    except Exception:
-        return pd.DataFrame(
-            {
-                "Gene Symbol": [pathlib.Path(csv_path).stem.upper() or "UNKNOWN"],
-                "Spectral Count": [1.0],
-                "Unique Peptides": [1],
-                "Confidence Score": [0.5],
-                "Log_Prob": [-np.log10(0.5)],
-                "is_baf_core": [False],
-                "Biological Target": [str(m.get("biological_target") or "Unknown")],
-                "Domain/Details": [str(m.get("domain_details") or "Unknown")],
-            }
-        )
+    return experiments_df, aggregated_by_file, meta_by_file, skipped_files, parsing_errors
 
 
 def _stem_from_meta_filename(filename: str | None) -> str | None:
@@ -1474,10 +1459,6 @@ def search_gene_across_datasets(
     aggregated_by_file: dict[str, pd.DataFrame],
     meta_by_file: dict[str, dict[str, Any]],
 ) -> pd.DataFrame:
-    """
-    Cross-dataset index over cached gene-level frames. SWIFT/SMARCD1–3 mapping: runs whose
-    resolved Biological Target contains the query appear in the index (with observed quantities).
-    """
     q = str(gene_query).strip()
     if not q:
         return pd.DataFrame()
@@ -1489,42 +1470,21 @@ def search_gene_across_datasets(
         if df_gene is None or df_gene.empty or "Gene Symbol" not in df_gene.columns:
             continue
         meta = meta_by_file.get(file_key, {})
-        bio = str(meta.get("biological_target", "N/A"))
-        bio_expanded = expand_biological_target_string(bio)
-        index_match = q_upper in bio_expanded
 
         mask = df_gene["Gene Symbol"].astype(str).str.strip().str.upper() == q_upper
         hit = df_gene.loc[mask]
-
         if hit.empty:
-            if not index_match:
-                continue
-            rows.append(
-                {
-                    "Investigator": meta.get("investigator") or "N/A",
-                    "Session ID": meta.get("session_id") or "N/A",
-                    "Label": meta.get("label") or "N/A",
-                    "Bio-Target": bio,
-                    "Spectral Count": 0,
-                    "Unique Peptides": 0,
-                    "Avg LDA": np.nan,
-                    "Dataset ID": meta.get("filename") or file_key.split("/")[-1],
-                    "_file_key": file_key,
-                }
-            )
             continue
 
         row = hit.iloc[0]
         rows.append(
             {
-                "Investigator": meta.get("investigator") or "N/A",
-                "Session ID": meta.get("session_id") or "N/A",
-                "Label": meta.get("label") or "N/A",
-                "Bio-Target": bio,
+                "Investigator": meta.get("investigator") or "Unknown",
+                "Bait": meta.get("bait") or "Unknown",
+                "Cell Line": meta.get("cell_line") or "Unknown",
+                "Exp ID": meta.get("session_id") or "Unknown",
                 "Spectral Count": row.get("Spectral Count"),
                 "Unique Peptides": row.get("Unique Peptides"),
-                "Avg LDA": row.get("Confidence Score"),
-                "Dataset ID": meta.get("filename") or file_key.split("/")[-1],
                 "_file_key": file_key,
             }
         )
@@ -1534,6 +1494,7 @@ def search_gene_across_datasets(
 
     out = pd.DataFrame(rows)
     out["Spectral Count"] = pd.to_numeric(out["Spectral Count"], errors="coerce")
+    out["Bait"] = out["Bait"].astype(str)
     out = out.sort_values("Spectral Count", ascending=False, kind="mergesort").reset_index(drop=True)
     return out
 
@@ -1567,13 +1528,9 @@ def _render_global_search_tab(
         return
 
     results = search_gene_across_datasets(q, aggregated_by_file, meta_by_file)
-    target_baf = q.strip().upper() in BAF_SUBUNIT_SET
-
-    if target_baf:
-        st.markdown(
-            "<span style='background:#FF4B4B;color:#fff;padding:4px 10px;border-radius:8px;font-weight:700;'>BAF Core</span>",
-            unsafe_allow_html=True,
-        )
+    baf_ip_only = st.checkbox("Filter for BAF-Core IPs only.", key="global_search_baf_ip_only")
+    if baf_ip_only and not results.empty:
+        results = results[results["Bait"].str.strip().str.upper().isin(BAF_SUBUNIT_SET)].copy()
 
     if results.empty:
         st.info(f"No detections found for **{q}** in current library.")
@@ -1581,34 +1538,29 @@ def _render_global_search_tab(
 
     r_obs = results[results["Spectral Count"].fillna(0) > 0]
     max_sc = int(r_obs["Spectral Count"].max()) if not r_obs.empty and r_obs["Spectral Count"].notna().any() else 0
-    r_rank = results.copy()
-    r_rank["Avg LDA"] = pd.to_numeric(r_rank["Avg LDA"], errors="coerce")
-    r_rank = r_rank.sort_values(
-        by=["Spectral Count", "Avg LDA"],
-        ascending=[False, False],
-        kind="mergesort",
-    )
-    top = r_rank.iloc[0]
-    meta0 = meta_by_file.get(str(top.get("_file_key", "")), {})
-    primary_bait = meta0.get("bait") or meta0.get("biological_target") or "N/A"
+    top = results.iloc[0]
+    primary_bait = top.get("Bait", "N/A")
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total Hits", f"{len(results)}")
     m2.metric("Highest Enrichment", f"{max_sc}")
-    m3.metric("Primary Interaction", str(primary_bait))
+    m3.metric("Top Bait", str(primary_bait))
 
-    df_show = results.drop(columns=["_file_key"], errors="ignore").copy()
+    df_show = results[["Investigator", "Bait", "Cell Line", "Exp ID", "Spectral Count", "Unique Peptides", "_file_key"]].copy()
 
     st.markdown("#### Results")
-    styler = _style_global_search_results(df_show, target_is_baf_core=target_baf)
-    st.dataframe(styler, use_container_width=True, height=min(520, 42 + 36 * len(df_show)))
+    st.dataframe(
+        df_show.drop(columns=["_file_key"], errors="ignore"),
+        use_container_width=True,
+        height=min(520, 42 + 36 * len(df_show)),
+    )
 
     st.markdown("#### Open in Dataset Browser")
     for i, r in results.iterrows():
         fk = r.get("_file_key")
         if not fk:
             continue
-        ds_id = r.get("Dataset ID", fk)
+        ds_id = f"{r.get('Exp ID', 'Unknown')} | {r.get('Bait', 'Unknown')}"
         label = f"Open **{ds_id}**"
         if st.button(label, key=f"global_open_{fk}_{i}"):
             st.session_state[_PENDING_PORTAL_DATASET_KEY] = str(fk)
@@ -1849,10 +1801,6 @@ def _render_data_vault_tab(
 
 def main() -> None:
     st.set_page_config(page_title="BAF-Complex IP-MS Analytics Portal", layout="wide")
-    # One-time hard cache reset to forget stale skip state.
-    if not st.session_state.get("_forced_cache_reset_once", False):
-        st.cache_data.clear()
-        st.session_state["_forced_cache_reset_once"] = True
     # Inject CSS at app startup so it applies globally.
     _apply_global_css()
 
@@ -1880,7 +1828,7 @@ def main() -> None:
         st.markdown("---")
         st.markdown("### Dataset Browser")
         try:
-            experiments_df, meta_by_file, skipped_files = load_portal_data(
+            experiments_df, aggregated_by_file, meta_by_file, skipped_files, parsing_errors = load_portal_data(
                 str(data_dir),
                 local_csv_count,
             )
@@ -1895,11 +1843,16 @@ def main() -> None:
             st.warning("No CSV datasets were parsed successfully. Please check CSV format/headers.")
             st.stop()
 
+        if parsing_errors:
+            with st.expander("View Parsing Errors"):
+                for pe in parsing_errors[:10]:
+                    st.write(f"- `{pe.get('file','unknown')}`: {pe.get('reason','Unknown error')}")
+                if len(parsing_errors) > 10:
+                    st.caption(f"... and {len(parsing_errors) - 10} more")
 
         dataset_keys_all = experiments_df["file_key"].astype(str).tolist()
         meta_lookup = meta_by_file
         labels = {k: _pretty_dataset_label(k, meta_lookup.get(k, {})) for k in dataset_keys_all}
-        aggregated_by_file: dict[str, pd.DataFrame] = {}
 
         # Apply investigator / global-search "set active" before portal_dataset_select widget is created.
         if _PENDING_PORTAL_DATASET_KEY in st.session_state:
@@ -1938,69 +1891,41 @@ def main() -> None:
             dataset_keys_for_picker = dataset_keys_all
 
         st.markdown("#### Browse by Investigator")
-        by_inv: dict[str, list[str]] = defaultdict(list)
+        browser_rows: list[dict[str, Any]] = []
         for fk in dataset_keys_for_picker:
-            inv = str(meta_lookup.get(fk, {}).get("investigator") or "N/A")
-            by_inv[inv].append(fk)
-        inv_options = sorted(by_inv.keys(), key=lambda s: (s == "N/A", s.lower()))
-        if "browser_investigator" not in st.session_state or st.session_state["browser_investigator"] not in inv_options:
-            st.session_state["browser_investigator"] = inv_options[0] if inv_options else "N/A"
-
-        st.selectbox("Investigator", options=inv_options, key="browser_investigator")
-        inv_selected = str(st.session_state.get("browser_investigator", inv_options[0] if inv_options else "N/A"))
-        inv_keys = sorted(by_inv.get(inv_selected, []))
-
-        inv_rows: list[dict[str, Any]] = []
-        for fk in inv_keys:
             m = meta_lookup.get(fk, {})
-            inv_rows.append(
+            browser_rows.append(
                 {
-                    "Dataset": fk,
-                    "Date": pd.to_datetime(float(m.get("mtime", 0.0)), unit="s", errors="coerce"),
-                    "Bait": m.get("bait") or "N/A",
-                    "Label": m.get("label") or "N/A",
-                    "Filename": m.get("filename") or fk.split("/")[-1],
+                    "Investigator": str(m.get("investigator") or "Unknown"),
+                    "Session ID": str(m.get("session_id") or "Unknown"),
+                    "Bait": str(m.get("bait") or "Unknown"),
+                    "Cell Line": str(m.get("cell_line") or "Unknown"),
+                    "Label": str(m.get("label") or "Unknown").replace(".csv", ""),
+                    "_file_key": fk,
                 }
             )
-        df_inv = pd.DataFrame(inv_rows)
-        if not df_inv.empty:
-            st.dataframe(df_inv[["Filename", "Date", "Bait", "Label", "Dataset"]], use_container_width=True, height=min(280, 72 + 28 * len(df_inv)))
-
-        if inv_keys:
-            active_cur = st.session_state.get(ACTIVE_DATASET_PICK_KEY)
-            if active_cur not in inv_keys:
-                st.session_state[ACTIVE_DATASET_PICK_KEY] = inv_keys[0]
-
-            df_pick = pd.DataFrame(
-                {
-                    "Session ID": [str(meta_lookup.get(k, {}).get("session_id") or "NoSession") for k in inv_keys],
-                    "Bait": [str(meta_lookup.get(k, {}).get("bait") or "N/A") for k in inv_keys],
-                    "Condition": [str(meta_lookup.get(k, {}).get("label") or "N/A").replace('.csv','') for k in inv_keys],
-                    "Replicate": [str(meta_lookup.get(k, {}).get("initials") or "—") for k in inv_keys],
-                    "_file_key": inv_keys,
-                    "_active": ["*" if k == st.session_state.get(ACTIVE_DATASET_PICK_KEY) else "" for k in inv_keys],
-                }
-            )
+        df_browser = pd.DataFrame(browser_rows)
+        if not df_browser.empty:
             event = st.dataframe(
-                df_pick[["_active", "Session ID", "Bait", "Condition", "Replicate"]],
+                df_browser[["Investigator", "Session ID", "Bait", "Cell Line", "Label"]],
                 hide_index=True,
                 use_container_width=True,
                 on_select="rerun",
                 selection_mode="single-row",
-                key="investigator_table_pick",
+                key="investigator_browser_table",
+                height=min(340, 80 + 26 * len(df_browser)),
             )
-            sel_rows = []
+            selected_rows = []
             try:
-                sel_rows = list(event.get("selection", {}).get("rows", [])) if isinstance(event, dict) else []
+                selected_rows = list(event.get("selection", {}).get("rows", [])) if isinstance(event, dict) else []
             except Exception:
-                sel_rows = []
-            if sel_rows:
-                idx = int(sel_rows[0])
-                if 0 <= idx < len(df_pick):
-                    picked = str(df_pick.iloc[idx]["_file_key"])
-                    if picked != st.session_state.get(ACTIVE_DATASET_PICK_KEY):
-                        st.session_state[ACTIVE_DATASET_PICK_KEY] = picked
-                        st.cache_data.clear()
+                selected_rows = []
+            if selected_rows:
+                pick_i = int(selected_rows[0])
+                if 0 <= pick_i < len(df_browser):
+                    picked_fk = str(df_browser.iloc[pick_i]["_file_key"])
+                    if picked_fk != st.session_state.get(ACTIVE_DATASET_PICK_KEY):
+                        st.session_state[ACTIVE_DATASET_PICK_KEY] = picked_fk
                         st.rerun()
 
         st.markdown("---")
@@ -2040,17 +1965,14 @@ def main() -> None:
         st.markdown("### Subunit Quick-Search")
         selected_subunit = st.selectbox("BAF subunit", options=BAF_SUBUNITS, index=0)
 
-        if st.button("Find matching datasets", key="subunit_find_btn"):
-            matches: list[str] = []
-            for key in dataset_keys_all:
-                dfg = _get_dataset_df(key, meta_by_file=meta_lookup)
-                if dfg is None or dfg.empty:
-                    continue
-                if _dataset_appearance_for_subunit(dfg, selected_subunit):
-                    matches.append(key)
-            st.session_state["subunit_matching_results"] = matches
-
-        matching = list(st.session_state.get("subunit_matching_results", []))
+        matches: list[str] = []
+        for key in dataset_keys_all:
+            dfg = aggregated_by_file.get(key)
+            if dfg is None or dfg.empty:
+                continue
+            if _dataset_appearance_for_subunit(dfg, selected_subunit):
+                matches.append(key)
+        matching = matches
         st.write(f"Detected in {len(matching)} experiment(s).")
 
         if matching:
@@ -2075,7 +1997,7 @@ def main() -> None:
     selected_dataset = str(st.session_state.get(ACTIVE_DATASET_PICK_KEY, dataset_keys_all[0]))
 
     try:
-        df_gene = _get_dataset_df(selected_dataset, meta_by_file=meta_by_file)
+        df_gene = aggregated_by_file[selected_dataset]
     except KeyError:
         st.error(
             f"Selected dataset is not available: {selected_dataset!r}. Choose another run in the sidebar."
@@ -2096,7 +2018,6 @@ def main() -> None:
     st.session_state["active_filename"] = str(meta_by_file.get(selected_dataset, {}).get("filename") or selected_dataset.split("/")[-1])
     st.session_state[ACTIVE_DF_STATE_KEY] = df_gene.copy()
     active_df: pd.DataFrame = st.session_state[ACTIVE_DF_STATE_KEY]
-    aggregated_by_file[selected_dataset] = active_df
 
     bait_gene_for_volcano = _infer_bait_gene_for_volcano(meta_by_file.get(selected_dataset, {}))
     with st.sidebar:
@@ -2205,12 +2126,8 @@ def main() -> None:
         )
 
     with tab_compare:
-        cmp_keys = [str(k) for k in st.session_state.get("compare_analytics_pick", [])]
-        for ck in cmp_keys:
-            if ck not in aggregated_by_file and ck in dataset_keys_all:
-                aggregated_by_file[ck] = _get_dataset_df(ck, meta_by_file=meta_by_file)
         _render_comparative_analytics_tab(
-            selected_keys=cmp_keys,
+            selected_keys=list(st.session_state.get("compare_analytics_pick", [])),
             dataset_keys_all=dataset_keys_all,
             aggregated_by_file=aggregated_by_file,
             meta_by_file=meta_by_file,
@@ -2225,13 +2142,8 @@ def main() -> None:
         )
 
     with tab_global:
-        gq = str(st.session_state.get("global_gene_query", ""))
-        if gq.strip():
-            for fk in dataset_keys_all:
-                if fk not in aggregated_by_file:
-                    aggregated_by_file[fk] = _get_dataset_df(fk, meta_by_file=meta_by_file)
         _render_global_search_tab(
-            gene_input=gq,
+            gene_input=str(st.session_state.get("global_gene_query", "")),
             aggregated_by_file=aggregated_by_file,
             meta_by_file=meta_by_file,
         )
@@ -2339,15 +2251,10 @@ def main() -> None:
 
                     st.dataframe(meta_runs, use_container_width=True, height=min(360, 72 + 28 * len(meta_runs)))
 
-                if st.button("Run batch consensus", key="batch_run_consensus"):
-                    for rk in runs:
-                        if rk not in aggregated_by_file:
-                            aggregated_by_file[rk] = _get_dataset_df(rk, meta_by_file=meta_by_file)
-                    cons = _lab_consensus_table(runs, aggregated_by_file, min_fraction=0.5)
-                    st.session_state["batch_consensus_df"] = cons
-
-                cons = st.session_state.get("batch_consensus_df", pd.DataFrame())
-                if isinstance(cons, pd.DataFrame) and not cons.empty:
+                cons = _lab_consensus_table(runs, aggregated_by_file, min_fraction=0.5)
+                if cons.empty:
+                    st.info("No proteins exceeded 50% prevalence across these runs.")
+                else:
                     st.dataframe(cons, use_container_width=True, height=520)
                     st.download_button(
                         "Download Consensus Table",

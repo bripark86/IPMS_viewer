@@ -205,33 +205,18 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
 
 def parse_filename_fuzzy(stem: str) -> tuple[Optional[str], Optional[str], str]:
     """
-    Session ID: first two numeric blocks (left-to-right).
-    Initials: token immediately following the second numeric block.
-    Label: remainder of stem (do not special-case trailing digits as replicates).
+    Preferred format: [Session]_[ID]_[Initials]_[CellLine]_[Bait]_[Rep...]
+    Returns (session_id, initials, label). Fallback keeps file visible.
     """
     parts = [p for p in str(stem).split("_") if p != ""]
     if not parts:
         return None, None, ""
-
-    numeric_positions: list[int] = []
-    for i, p in enumerate(parts):
-        if p.isdigit():
-            numeric_positions.append(i)
-        if len(numeric_positions) == 2:
-            break
-
-    if len(numeric_positions) < 2:
-        return "Unknown", "Unknown", "_".join(parts)
-
-    i0, i1 = numeric_positions[0], numeric_positions[1]
-    session_id = f"{parts[i0]}_{parts[i1]}"
-    j = i1 + 1
-    if j >= len(parts):
-        return session_id, "Unknown", "Unknown"
-
-    initials = parts[j]
-    label = "_".join(parts[j + 1 :]) if j + 1 < len(parts) else ""
-    return session_id, initials, label
+    if len(parts) >= 6:
+        session_id = f"{parts[0]}_{parts[1]}"
+        initials = parts[2] if parts[2] else "Unknown"
+        label = "_".join(parts[3:]) if len(parts) > 3 else "Unknown"
+        return session_id, initials, label
+    return "Unknown", "Unknown", "_".join(parts)
 
 
 def extract_metadata_from_filename(filename: str) -> tuple[Optional[str], Optional[str], Optional[int]]:
@@ -275,7 +260,12 @@ def scan_csv_files(data_dir: str) -> list[ExperimentMeta]:
 
     for root, _dirs, files in os.walk(data_root):
         for name in files:
-            if not name.lower().endswith(".csv"):
+            nlow = name.lower()
+            if name.startswith('.'):
+                continue
+            if "_processed" in nlow:
+                continue
+            if not nlow.endswith(".csv"):
                 continue
             path = os.path.join(root, name)
             try:
@@ -314,14 +304,19 @@ def enrich_meta_dict(meta: ExperimentMeta) -> dict[str, object]:
     inv_s = meta.investigator if meta.investigator else None
     label = meta.label or ""
     stem = meta.filename[: -len(".csv")] if meta.filename.lower().endswith(".csv") else meta.filename
-    bait_guess = infer_bait_gene_from_label(meta.label, stem)
-    bio, domain, disp_bait = resolve_biological_fields(meta.label, stem, bait_gene_guess=bait_guess)
-
+    stem_parts = [p for p in str(stem).split("_") if p]
+    bait_from_name = None
     cell_line = None
-    if label:
+    if len(stem_parts) >= 6:
+        cell_line = stem_parts[3]
+        bait_from_name = stem_parts[4]
+    elif label:
         toks = label.split("_")
         if toks and toks[0]:
             cell_line = toks[0]
+
+    bait_guess = bait_from_name or infer_bait_gene_from_label(meta.label, stem)
+    bio, domain, disp_bait = resolve_biological_fields(meta.label, stem, bait_gene_guess=bait_guess)
 
     return {
         "file_key": meta.file_key,
@@ -334,7 +329,7 @@ def enrich_meta_dict(meta: ExperimentMeta) -> dict[str, object]:
         "initials": meta.initials or "Unknown",
         "label": meta.label or "Unknown",
         "cell_line": cell_line,
-        "bait": disp_bait if disp_bait != "N/A" else (bait_guess or "N/A"),
+        "bait": disp_bait if disp_bait != "N/A" else (bait_guess or "Unknown"),
         "replicate": None,
         "biological_target": bio,
         "domain_details": domain,
