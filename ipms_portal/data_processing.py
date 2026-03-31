@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import re
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 
 from ipms_portal.biological_aliases import infer_bait_gene_from_label, resolve_biological_fields
+from ipms_portal.constants import BAF_SUBUNITS as BAF_SUBUNIT_LIST
 
 pd.set_option("future.no_silent_downcasting", True)
 
@@ -209,6 +210,83 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
     out["Log_Prob"] = -np.log10(cs)
     out.attrs["ipms_lda_probability_column_in_csv"] = bool(col_conf is not None)
     return out
+
+
+def get_experiment_data(
+    file_path: str,
+    *,
+    biological_target: str = "Unknown",
+    domain_details: str = "Unknown",
+) -> pd.DataFrame:
+    """
+    Heavy path: read CSV, aggregate peptide→gene, add BAF flags and experiment columns.
+    Call only when a specific experiment is activated (lazy loading).
+    """
+    try:
+        df_gene = load_and_aggregate_csv(file_path)
+        lda_csv_ok = bool(df_gene.attrs.get("ipms_lda_probability_column_in_csv", True))
+    except Exception:
+        base = os.path.basename(file_path)
+        stem = base[: -len(".csv")] if base.lower().endswith(".csv") else base
+        df_gene = pd.DataFrame(
+            {
+                "Gene Symbol": [stem.upper() or "UNKNOWN"],
+                "Spectral Count": [1.0],
+                "Unique Peptides": [1],
+                "Confidence Score": [0.5],
+                "Log_Prob": [-np.log10(0.5)],
+            }
+        )
+        lda_csv_ok = False
+        df_gene.attrs["ipms_lda_probability_column_in_csv"] = False
+
+    df_gene = add_baf_core_indicator(df_gene, list(BAF_SUBUNIT_LIST))
+    df_gene = add_experiment_biological_columns(
+        df_gene,
+        biological_target=str(biological_target),
+        domain_details=str(domain_details),
+    )
+    df_gene.attrs["ipms_lda_probability_column_in_csv"] = lda_csv_ok
+    return df_gene
+
+
+def crawl_metadata(data_dir: str, file_count: int) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+    """
+    Lightweight startup crawl: os.walk + filename metadata only (no CSV read).
+    """
+    _ = file_count
+    data_root = os.path.abspath(os.path.normpath(data_dir))
+    metas = scan_csv_files(data_root)
+    experiments_rows: list[dict[str, Any]] = []
+    meta_by_file: dict[str, dict[str, Any]] = {}
+
+    for meta in metas:
+        enriched = enrich_meta_dict(meta)
+        d = dict(enriched)
+        meta_by_file[meta.file_key] = d
+        experiments_rows.append(
+            {
+                "file_key": meta.file_key,
+                "filename": meta.filename,
+                "investigator": d.get("investigator") or "Unknown",
+                "session_id": d.get("session_id") or "Unknown",
+                "initials": d.get("initials") or "Unknown",
+                "label": d.get("label") or "Unknown",
+                "cell_line": d.get("cell_line") or "Unknown",
+                "bait": d.get("bait") or "Unknown",
+                "biological_target": d.get("biological_target") or "Unknown",
+                "domain_details": d.get("domain_details") or "Unknown",
+                "mtime": meta.mtime,
+                "path": d.get("path") or meta.path,
+                "n_proteins": pd.NA,
+                "n_baf_core": pd.NA,
+            }
+        )
+
+    experiments_df = pd.DataFrame(experiments_rows)
+    if not experiments_df.empty and "mtime" in experiments_df.columns:
+        experiments_df = experiments_df.sort_values("mtime", ascending=False).reset_index(drop=True)
+    return experiments_df, meta_by_file
 
 
 def parse_filename_fuzzy(stem: str) -> tuple[Optional[str], Optional[str], str]:
