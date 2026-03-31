@@ -358,6 +358,11 @@ def enrich_meta_dict(meta: ExperimentMeta) -> dict[str, object]:
         "bait": disp_bait if disp_bait != "N/A" else (bait_guess or "Unknown"),
         "replicate": None,
         "biological_target": bio,
+        "resolved_target": (
+            bio
+            if str(bio).strip().upper() not in ("", "N/A", "NA")
+            else (disp_bait if str(disp_bait).strip().upper() not in ("", "N/A", "NA") else (sample_label or "—"))
+        ),
         "domain_details": domain,
     }
 

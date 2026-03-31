@@ -913,7 +913,7 @@ def _make_volcano_figure(
     )
     if use_log_x:
         x_upper = np.log10(max(float(pos_only.max()), 1.0)) if len(pos_only) else 1.0
-        x_upper = min(max(3.0, x_upper * 1.05), 4.0)
+        x_upper = min(max(3.0, x_upper * 1.05), 3.0)
         xaxis_cfg["range"] = [0.0, x_upper]
     else:
         xaxis_cfg["range"] = [0.0, max(float(pos.max()) * 1.1, 3.0)]
@@ -1584,6 +1584,9 @@ def _aggregated_download_name(meta: dict[str, Any], fallback_filename: str) -> s
 
 def _vault_resolve_target_from_meta(meta: dict[str, Any]) -> str:
     """Prefer biological target, then inferred bait; fall back to sample label."""
+    rt = str(meta.get("resolved_target") or "").strip()
+    if rt and rt.upper() not in ("N/A", "NA", ""):
+        return rt
     bt = str(meta.get("biological_target") or "").strip()
     if bt and bt.upper() not in ("N/A", "NA", ""):
         return bt
@@ -1649,7 +1652,10 @@ def _render_data_vault_tab(
     s3.metric("Storage Used (MB)", f"{storage_mb:.2f}")
 
     st.markdown("#### Filter & layout")
-    bait_query = st.text_input("Search (bait / target / label / filename)", placeholder="e.g. SMARCA4, SWIFT, BCL7")
+    bait_query = st.text_input(
+        "Global filter (bait / target / label / filename / investigator)",
+        placeholder="e.g. SMARCA4, SWIFT, BCL7, Jordan_Otto",
+    )
     bait_q = bait_query.strip().upper()
 
     work = experiments_df.copy()
@@ -1678,7 +1684,7 @@ def _render_data_vault_tab(
 
     group_mode = st.radio(
         "Group rows by",
-        ["None (flat table)", "Investigator", "Session ID"],
+        ["None (Flat)", "Investigator", "Session ID"],
         horizontal=True,
         key="vault_group_mode",
     )
@@ -1714,7 +1720,7 @@ def _render_data_vault_tab(
     st.markdown("#### Experiments")
     row_h = min(520, 80 + 28 * len(display_base))
 
-    if group_mode == "None (flat table)":
+    if group_mode == "None (Flat)":
         view = display_base.sort_values(
             by=["Investigator", "Session ID", "Target", "File"],
             key=lambda c: c.map(str) if c.name in ("Investigator", "Session ID", "Target", "File") else c,
@@ -1896,43 +1902,57 @@ def main() -> None:
         st.selectbox("Investigator", options=inv_options, key="browser_investigator")
         inv_selected = str(st.session_state.get("browser_investigator", inv_options[0] if inv_options else "Unknown"))
         inv_keys = by_inv.get(inv_selected, [])
+        if inv_keys:
+            if st.session_state.get("browser_dataset_pick") not in inv_keys:
+                cur = str(st.session_state.get(ACTIVE_DATASET_PICK_KEY, inv_keys[0]))
+                st.session_state["browser_dataset_pick"] = cur if cur in inv_keys else inv_keys[0]
+            st.selectbox(
+                "Experiment",
+                options=inv_keys,
+                format_func=lambda fk: _vault_action_label(fk, meta_lookup),
+                key="browser_dataset_pick",
+            )
+            picked_fk = str(st.session_state.get("browser_dataset_pick", inv_keys[0]))
+            if picked_fk != st.session_state.get(ACTIVE_DATASET_PICK_KEY):
+                st.session_state[ACTIVE_DATASET_PICK_KEY] = picked_fk
+                st.rerun()
 
-        browser_rows: list[dict[str, Any]] = []
-        for fk in inv_keys:
-            m = meta_lookup.get(fk, {})
-            browser_rows.append(
-                {
-                    "Session ID": str(m.get("session_id") or "Unknown"),
-                    "Initials": str(m.get("initials") or "Unknown"),
-                    "Bait": str(m.get("bait") or "Unknown"),
-                    "Cell Line": str(m.get("cell_line") or "Unknown"),
-                    "Sample Label": str(m.get("label") or "Unknown").replace(".csv", ""),
-                    "_file_key": fk,
-                }
-            )
-        df_browser = pd.DataFrame(browser_rows)
-        if not df_browser.empty:
-            event = st.dataframe(
-                df_browser[["Session ID", "Initials", "Bait", "Cell Line", "Sample Label"]],
-                hide_index=True,
-                use_container_width=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="investigator_browser_table",
-                height=min(340, 80 + 26 * len(df_browser)),
-            )
-            selected_rows = []
-            try:
-                selected_rows = list(event.get("selection", {}).get("rows", [])) if isinstance(event, dict) else []
-            except Exception:
-                selected_rows = []
-            if selected_rows:
-                pick_i = int(selected_rows[0])
-                if 0 <= pick_i < len(df_browser):
-                    picked_fk = str(df_browser.iloc[pick_i]["_file_key"])
-                    if picked_fk != st.session_state.get(ACTIVE_DATASET_PICK_KEY):
-                        st.session_state[ACTIVE_DATASET_PICK_KEY] = picked_fk
-                        st.rerun()
+            st.caption("Actions")
+            meta_sel = meta_lookup.get(picked_fk, {})
+            fpath = str(meta_sel.get("path") or os.path.join(str(data_dir), picked_fk))
+            fn = str(meta_sel.get("filename") or picked_fk.split("/")[-1])
+            df_agg = aggregated_by_file.get(picked_fk)
+            b1, b2 = st.columns([1, 1])
+            with b1:
+                if df_agg is not None and not df_agg.empty:
+                    df_dl = df_agg.sort_values(
+                        by=["is_baf_core", "Spectral Count", "Confidence Score"],
+                        ascending=[False, False, False],
+                        kind="mergesort",
+                    )
+                    st.download_button(
+                        "Download Aggregated CSV",
+                        data=df_dl.to_csv(index=False).encode("utf-8"),
+                        file_name=_aggregated_download_name(meta_sel, fn),
+                        mime="text/csv",
+                        key="sidebar_download_selected",
+                    )
+                else:
+                    st.caption("No aggregated data.")
+            with b2:
+                del_conf_sidebar = st.checkbox("Confirm Delete", key="sidebar_delete_confirm")
+                if st.button("Delete Selected File", key="sidebar_delete_btn"):
+                    if not del_conf_sidebar:
+                        st.warning("Enable **Confirm Delete** first.")
+                    else:
+                        try:
+                            if os.path.exists(fpath):
+                                os.remove(fpath)
+                            load_portal_data.clear()
+                            st.success(f"Deleted `{picked_fk}`.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
 
         st.markdown("---")
         st.markdown("### Upload IP-MS CSVs")

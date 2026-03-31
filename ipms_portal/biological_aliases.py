@@ -7,6 +7,48 @@ from ipms_portal.constants import BAF_SUBUNITS
 
 BAF_SUBUNIT_SET = set(BAF_SUBUNITS)
 
+# Expanded SWI/SNF (BAF) aliases -> canonical gene symbol.
+BAF_ALIAS_TO_GENE: dict[str, str] = {
+    "SMARCC1": "SMARCC1",
+    "BAF155": "SMARCC1",
+    "SMARCC2": "SMARCC2",
+    "BAF170": "SMARCC2",
+    "SMARCB1": "SMARCB1",
+    "BAF47": "SMARCB1",
+    "SMARCE1": "SMARCE1",
+    "BAF57": "SMARCE1",
+    "SMARCD1": "SMARCD1",
+    "BAF60A": "SMARCD1",
+    "SMARCD2": "SMARCD2",
+    "BAF60B": "SMARCD2",
+    "SMARCD3": "SMARCD3",
+    "BAF60C": "SMARCD3",
+    "DPF1": "DPF1",
+    "DPF2": "DPF2",
+    "BAF45B": "DPF2",
+    "SMARCA2": "SMARCA2",
+    "BRM": "SMARCA2",
+    "SMARCA4": "SMARCA4",
+    "BRG1": "SMARCA4",
+    "ACTL6A": "ACTL6A",
+    "ACTL6B": "ACTL6B",
+    "ACTB": "ACTB",
+    "ARID1A": "ARID1A",
+    "ARID1B": "ARID1B",
+    "ARID2": "ARID2",
+    "PBRM1": "PBRM1",
+    "BRD7": "BRD7",
+    "PHF10": "PHF10",
+    "BRD9": "BRD9",
+    "BICRA": "BICRA",
+    "GLTSCR1": "BICRA",
+    "BICRAL": "BICRAL",
+    "GLTSCR1L": "BICRAL",
+    "BCL7A": "BCL7A",
+    "BCL7B": "BCL7B",
+    "BCL7C": "BCL7C",
+}
+
 
 def expand_biological_target_string(bio: str) -> set[str]:
     """
@@ -78,6 +120,10 @@ def infer_bait_gene_from_label(label: str | None, stem: str | None = None) -> Op
         tokens.extend(str(stem).replace("-", "_").split("_"))
     for tok in tokens:
         t = tok.strip().upper()
-        if t and t in BAF_SUBUNIT_SET:
+        if not t:
+            continue
+        if t in BAF_ALIAS_TO_GENE:
+            return BAF_ALIAS_TO_GENE[t]
+        if t in BAF_SUBUNIT_SET:
             return t
     return None
