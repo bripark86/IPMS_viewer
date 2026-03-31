@@ -231,10 +231,36 @@ def _styled_gene_table(df: pd.DataFrame) -> Any:
     return df.style.apply(highlight_gene_symbol, axis=1, subset=["Gene Symbol"])
 
 
-@st.cache_data(show_spinner=True)
+@st.cache_data(show_spinner="Accessing BAF-Vault...")
+def process_csv(csv_path: str, csv_mtime: float) -> pd.DataFrame:
+    """Load pre-aggregated _PROCESSED.csv when fresh; else aggregate peptide->gene and persist."""
+    _ = csv_mtime
+    p = pathlib.Path(csv_path)
+    processed = p.with_name(f"{p.stem}_PROCESSED.csv")
+
+    if processed.exists():
+        try:
+            pm = processed.stat().st_mtime
+            if pm >= float(csv_mtime):
+                d = pd.read_csv(processed)
+                if "Gene Symbol" in d.columns and "Spectral Count" in d.columns:
+                    d.attrs["ipms_lda_probability_column_in_csv"] = True
+                    return d
+        except Exception:
+            pass
+
+    d = load_and_aggregate_csv(str(p))
+    try:
+        d.to_csv(processed, index=False)
+    except Exception:
+        pass
+    return d
+
+
+@st.cache_data(show_spinner="Accessing BAF-Vault...")
 def load_portal_data(
     data_dir: str,
-    refresh_token: int,
+    file_count: int,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, dict[str, Any]], list[str]]:
     """
     Returns:
@@ -242,9 +268,9 @@ def load_portal_data(
     - aggregated_by_file: mapping file_key -> gene-level aggregated df (with is_baf_core, bio columns)
     - meta_by_file: mapping file_key -> dict meta fields (for UI labeling)
     """
-    _ = refresh_token  # included to force cache invalidation on refresh
+    _ = file_count  # cache invalidates when Data/ CSV count changes
     data_root = os.path.abspath(os.path.normpath(data_dir))
-    print(f"[IPMS Debug] load_portal_data: scanning repository Data at {data_root!r} (refresh_token={refresh_token})")
+    print(f"[IPMS Debug] load_portal_data: scanning repository Data at {data_root!r} (file_count={file_count})")
     metas = scan_csv_files(data_root)
     experiments_rows: list[dict[str, Any]] = []
     aggregated_by_file: dict[str, pd.DataFrame] = {}
@@ -253,7 +279,7 @@ def load_portal_data(
 
     for meta in metas:
         try:
-            df_gene = load_and_aggregate_csv(meta.path)
+            df_gene = process_csv(meta.path, meta.mtime)
             lda_csv_ok = bool(df_gene.attrs.get("ipms_lda_probability_column_in_csv", True))
             df_gene = add_baf_core_indicator(df_gene, BAF_SUBUNITS)
             enriched = enrich_meta_dict(meta)
@@ -1776,39 +1802,12 @@ def main() -> None:
     with st.sidebar:
         _ensure_local_data_dir(data_dir)
 
-        if "data_refresh_token" not in st.session_state:
-            st.session_state["data_refresh_token"] = 0
         st.markdown("### Data Directory & File Management")
 
-        upload_subfolder = st.text_input(
-            "Upload subfolder under Data/",
-            value="Imported",
-            help="Creates `Data/<subfolder>/` and places uploaded CSVs there.",
-        )
-        overwrite = st.checkbox("Overwrite existing files on upload", value=False)
-        uploaded_files = st.file_uploader(
-            "Upload IP-MS CSV files",
-            type=["csv"],
-            accept_multiple_files=True,
-            help="Upload one or more CSVs. Files are saved under Data/<subfolder>/ for analysis.",
-        )
-        if uploaded_files:
-            try:
-                counts = save_uploaded_csvs_to_local_data(
-                    uploaded_files,
-                    str(data_dir),
-                    overwrite=overwrite,
-                    subfolder=str(upload_subfolder or "Imported"),
-                )
-                st.success(
-                    f"Upload complete: saved {counts['saved']} file(s), skipped {counts['skipped']} existing file(s)."
-                )
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
-
         if st.button("Refresh Data"):
-            st.session_state["data_refresh_token"] += 1
+            process_csv.clear()
             load_portal_data.clear()
+            st.rerun()
 
         local_csv_count = _count_csv_files(str(data_dir))
         if local_csv_count == 0:
@@ -1820,7 +1819,7 @@ def main() -> None:
         try:
             experiments_df, aggregated_by_file, meta_by_file, skipped_files = load_portal_data(
                 str(data_dir),
-                st.session_state["data_refresh_token"],
+                local_csv_count,
             )
         except Exception as e:
             st.error(
@@ -1909,19 +1908,52 @@ def main() -> None:
             active_cur = st.session_state.get(ACTIVE_DATASET_PICK_KEY)
             if active_cur not in inv_keys:
                 st.session_state[ACTIVE_DATASET_PICK_KEY] = inv_keys[0]
-            if st.session_state.get("investigator_dataset_pick") not in inv_keys:
-                st.session_state["investigator_dataset_pick"] = inv_keys[0]
-            st.radio(
-                "Experiment",
-                options=inv_keys,
-                format_func=lambda kk: _friendly_experiment_label(kk, meta_lookup.get(kk, {})),
-                key="investigator_dataset_pick",
+
+            df_pick = pd.DataFrame(
+                {
+                    "Session ID": [str(meta_lookup.get(k, {}).get("session_id") or "NoSession") for k in inv_keys],
+                    "Bait": [str(meta_lookup.get(k, {}).get("bait") or "N/A") for k in inv_keys],
+                    "Condition": [str(meta_lookup.get(k, {}).get("label") or "N/A").replace('.csv','') for k in inv_keys],
+                    "Replicate": [str(meta_lookup.get(k, {}).get("initials") or "—") for k in inv_keys],
+                    "_file_key": inv_keys,
+                    "_active": ["*" if k == st.session_state.get(ACTIVE_DATASET_PICK_KEY) else "" for k in inv_keys],
+                }
             )
-            picked = str(st.session_state.get("investigator_dataset_pick", inv_keys[0]))
-            if picked != st.session_state.get(ACTIVE_DATASET_PICK_KEY):
-                st.session_state[ACTIVE_DATASET_PICK_KEY] = picked
-                st.cache_data.clear()
-                st.rerun()
+            event = st.dataframe(
+                df_pick[["_active", "Session ID", "Bait", "Condition", "Replicate"]],
+                hide_index=True,
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="investigator_table_pick",
+            )
+            sel_rows = []
+            try:
+                sel_rows = list(event.get("selection", {}).get("rows", [])) if isinstance(event, dict) else []
+            except Exception:
+                sel_rows = []
+            if sel_rows:
+                idx = int(sel_rows[0])
+                if 0 <= idx < len(df_pick):
+                    picked = str(df_pick.iloc[idx]["_file_key"])
+                    if picked != st.session_state.get(ACTIVE_DATASET_PICK_KEY):
+                        st.session_state[ACTIVE_DATASET_PICK_KEY] = picked
+                        st.cache_data.clear()
+                        st.rerun()
+
+        st.markdown("---")
+        st.markdown("### Upload IP-MS CSVs")
+        uploaded_files = st.file_uploader(
+            "Upload CSV files",
+            type=["csv"],
+            accept_multiple_files=True,
+        )
+        if uploaded_files:
+            try:
+                counts = save_uploaded_csvs_to_local_data(uploaded_files, str(data_dir), subfolder="Imported", overwrite=False)
+                st.success(f"Upload complete: saved {counts['saved']} file(s), skipped {counts['skipped']} existing file(s).")
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
 
         st.markdown("---")
         st.markdown("### Comparative Analytics")
