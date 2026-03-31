@@ -29,3 +29,7 @@ BAF_SUBUNITS = [
 
 BAF_CORE_COLOR = "#FF4B4B"
 
+# Shared metadata parsing constants.
+COMMON_CELL_LINES = ["K562", "MOLM13", "G401", "A549", "OCILY1"]
+METADATA_SPLIT_REGEX = r"_+"
+

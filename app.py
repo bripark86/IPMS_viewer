@@ -18,11 +18,8 @@ from ipms_portal.biological_aliases import (
 )
 from ipms_portal.constants import BAF_CORE_COLOR, BAF_SUBUNITS
 from ipms_portal.data_processing import (
-    add_baf_core_indicator,
-    add_experiment_biological_columns,
     crawl_metadata,
-    get_experiment_data,
-    load_and_aggregate_csv,
+    load_and_process_file,
 )
 
 DATA_SOURCE_DIR_DEFAULT = "/Users/sp1665/Downloads/IPMS/Janet_Liu"
@@ -231,7 +228,7 @@ def process_csv(csv_path: str, csv_mtime: float) -> pd.DataFrame:
     """Legacy shim: aggregate directly from source CSV (no _PROCESSED writes)."""
     _ = csv_mtime
     try:
-        d = load_and_aggregate_csv(str(csv_path))
+        d = load_and_process_file(str(csv_path))
     except Exception:
         # permissive fallback keeps file searchable instead of skipping it entirely
         p = pathlib.Path(csv_path)
@@ -258,7 +255,7 @@ def _cached_crawl_metadata(data_dir: str, file_count: int) -> tuple[pd.DataFrame
 @st.cache_data(show_spinner=False)
 def _cached_aggregate_experiment(path: str, mtime: float, bio: str, domain: str) -> pd.DataFrame:
     """One-file heavy aggregation (cached by path + mtime + meta strings)."""
-    return get_experiment_data(path, biological_target=bio, domain_details=domain)
+    return load_and_process_file(path, biological_target=bio, domain_details=domain)
 
 
 def _session_indexed_aggregates() -> dict[str, pd.DataFrame]:

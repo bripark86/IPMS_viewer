@@ -9,17 +9,16 @@ import numpy as np
 import pandas as pd
 
 from ipms_portal.biological_aliases import infer_bait_gene_from_label, resolve_biological_fields
-from ipms_portal.constants import BAF_SUBUNITS as BAF_SUBUNIT_LIST
+from ipms_portal.constants import (
+    BAF_SUBUNITS as BAF_SUBUNIT_LIST,
+    COMMON_CELL_LINES,
+    METADATA_SPLIT_REGEX,
+)
 
 pd.set_option("future.no_silent_downcasting", True)
 
-BAF_SUBUNITS = {
-    "SMARCA4", "SMARCA2", "SMARCB1", "SMARCC1", "SMARCC2", "ARID1A", "ARID1B",
-    "ARID2", "PBRM1", "BRD7", "BRD9", "ACTL6A", "ACTL6B", "BCL7A", "BCL7B",
-    "BCL7C", "DPF1", "DPF2", "DPF3", "PHF10", "SS18", "SS18L1", "SMARCD1",
-    "SMARCD2", "SMARCD3", "GLTSCR1",
-}
-COMMON_CELL_LINES = {"K562", "MOLM13", "G401", "A549", "OCILY1"}
+BAF_SUBUNITS = set(BAF_SUBUNIT_LIST)
+COMMON_CELL_LINES_SET = {str(x).upper() for x in COMMON_CELL_LINES}
 
 
 @dataclass(frozen=True)
@@ -250,6 +249,20 @@ def get_experiment_data(
     return df_gene
 
 
+def load_and_process_file(
+    file_path: str,
+    *,
+    biological_target: str = "Unknown",
+    domain_details: str = "Unknown",
+) -> pd.DataFrame:
+    """Alias used by app lazy-loading path."""
+    return get_experiment_data(
+        file_path,
+        biological_target=biological_target,
+        domain_details=domain_details,
+    )
+
+
 def crawl_metadata(data_dir: str, file_count: int) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
     """
     Lightweight startup crawl: os.walk + filename metadata only (no CSV read).
@@ -289,6 +302,11 @@ def crawl_metadata(data_dir: str, file_count: int) -> tuple[pd.DataFrame, dict[s
     return experiments_df, meta_by_file
 
 
+def crawl_filenames(data_dir: str, file_count: int) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
+    """Alias used by app startup path."""
+    return crawl_metadata(data_dir, file_count)
+
+
 def parse_filename_fuzzy(stem: str) -> tuple[Optional[str], Optional[str], str]:
     """
     Label-agnostic parsing:
@@ -296,7 +314,7 @@ def parse_filename_fuzzy(stem: str) -> tuple[Optional[str], Optional[str], str]:
     - Initials: third underscore block when present.
     - Sample Label: everything after initials.
     """
-    parts = [p for p in str(stem).split("_") if p != ""]
+    parts = [p for p in re.split(METADATA_SPLIT_REGEX, str(stem)) if p != ""]
     if not parts:
         return None, None, ""
 
@@ -314,7 +332,7 @@ def parse_filename_fuzzy(stem: str) -> tuple[Optional[str], Optional[str], str]:
 
 
 def _parse_label_heuristics(label: str) -> tuple[str, str | None, str | None]:
-    toks = [t for t in str(label).split("_") if t]
+    toks = [t for t in re.split(METADATA_SPLIT_REGEX, str(label)) if t]
     if not toks:
         return "Unknown", None, None
     bait = None
@@ -325,7 +343,7 @@ def _parse_label_heuristics(label: str) -> tuple[str, str | None, str | None]:
         if bait is None and up in BAF_SUBUNITS:
             bait = up
             continue
-        if cell is None and up in COMMON_CELL_LINES:
+        if cell is None and up in COMMON_CELL_LINES_SET:
             cell = up
             continue
         kept.append(tok)
