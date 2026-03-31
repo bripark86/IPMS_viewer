@@ -34,7 +34,7 @@ DATA_ROOT = pathlib.Path(__file__).parent.resolve() / "Data"
 _PENDING_PORTAL_DATASET_KEY = "_pending_portal_dataset"
 ACTIVE_DATASET_STATE_KEY = "active_dataset_id"
 ACTIVE_DF_STATE_KEY = "active_df"
-ACTIVE_DATASET_PICK_KEY = "active_dataset"
+ACTIVE_DATASET_PICK_KEY = "global_active_dataset"
 _DATASET_SWITCH_RERUN_KEY = "_dataset_switch_rerun"
 CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
 # Horizontal reference line on volcano: y = -log10(p); change here or wire to UI later.
@@ -317,6 +317,14 @@ def _infer_bait_gene_for_volcano(meta: dict[str, Any]) -> str | None:
 def _short_dataset_label(file_key: str, meta: dict[str, Any], *, max_len: int = 32) -> str:
     fn = str(meta.get("filename") or file_key.split("/")[-1])
     return (fn[: max_len - 1] + "…") if len(fn) > max_len else fn
+
+
+def _friendly_experiment_label(file_key: str, meta: dict[str, Any]) -> str:
+    sid = str(meta.get("session_id") or "NoSession")
+    bait = str(meta.get("bait") or "N/A")
+    label = str(meta.get("label") or "N/A")
+    label = label.replace(".csv", "")
+    return f"[{sid}] - {bait} - {label}"
 
 
 def _investigator_folder_from_file_key(file_key: str) -> str | None:
@@ -740,10 +748,10 @@ def _make_volcano_figure(
     bait_non_baf_color = "#FFD700"
 
     df = active_dataset.copy()
-    df["Spectral Count"] = pd.to_numeric(df["Spectral Count"], errors="coerce")
+    df["Spectral Count"] = pd.to_numeric(df["Spectral Count"], errors="coerce").fillna(0.0)
     df["Log_Prob"] = pd.to_numeric(df["Log_Prob"], errors="coerce")
-    df = df.dropna(subset=["Log_Prob", "Spectral Count"], how="any")
-    df = df[df["Spectral Count"] > 0]
+    df = df.dropna(subset=["Log_Prob"], how="any")
+    df = df[df["Spectral Count"] >= 0]
 
     if df.empty:
         fig = go.Figure()
@@ -758,7 +766,8 @@ def _make_volcano_figure(
 
     df = df.copy()
     df["Log_Prob_plot"] = _log_prob_y_with_jitter(df["Log_Prob"], df["Gene Symbol"])
-    df["Spectral Count_plot"] = _spectral_x_with_jitter(df["Spectral Count"], dataset_id=dataset_id)
+    df["Spectral Count_plus1"] = df["Spectral Count"].astype(float) + 1.0
+    df["Spectral Count_plot"] = _spectral_x_with_jitter(df["Spectral Count_plus1"], dataset_id=dataset_id)
 
     genes_u = df["Gene Symbol"].astype(str).str.strip().str.upper()
     bait_u = bait_gene.strip().upper() if bait_gene else None
@@ -769,14 +778,13 @@ def _make_volcano_figure(
     df_baf_circle = df.loc[is_baf & ~is_bait]
     df_prey = df.loc[~is_baf & ~is_bait]
 
-    pos = df["Spectral Count"].astype(float)
+    pos = df["Spectral Count_plus1"].astype(float)
     pos_only = pos[pos > 0]
     use_log_x = False
     if force_log_x is not None:
         use_log_x = force_log_x
-    elif len(pos_only) >= 3:
-        ratio = float(pos_only.max()) / float(max(pos_only.min(), 1.0))
-        use_log_x = pos_only.max() > 80 or ratio >= 25.0
+    else:
+        use_log_x = float(pos_only.max()) >= 30.0 if len(pos_only) else False
 
     fig = go.Figure()
 
@@ -833,20 +841,22 @@ def _make_volcano_figure(
         bcol = core_color if bait_u in BAF_SUBUNIT_SET else bait_non_baf_color
         _scatter_trace(df_bait, name=f"Bait ({bait_u})", color=bcol, size=18, symbol="diamond")
 
-    default_xtitle = "Spectral Count (log scale)" if use_log_x else "Spectral Count"
+    default_xtitle = "Spectral Count (+1, log scale)" if use_log_x else "Spectral Count (+1)"
     xaxis_cfg: dict[str, Any] = dict(
         title=(xaxis_title or default_xtitle),
         gridcolor="rgba(255,255,255,0.08)",
         type="log" if use_log_x else "linear",
     )
-    if xaxis_range is not None:
+    if use_log_x:
+        x_upper = np.log10(max(float(pos_only.max()), 1.0)) if len(pos_only) else 1.0
+        x_upper = min(max(3.0, x_upper * 1.05), 4.0)
+        xaxis_cfg["range"] = [0.0, x_upper]
+    else:
+        xaxis_cfg["range"] = [0.0, max(float(pos.max()) * 1.1, 3.0)]
+    if xaxis_range is not None and not use_log_x:
         lo, hi = float(xaxis_range[0]), float(xaxis_range[1])
-        if lo <= 0 or hi <= 0:
-            pass
-        elif use_log_x:
-            xaxis_cfg["range"] = [np.log10(max(lo, 1e-12)), np.log10(max(hi, 1e-12))]
-        else:
-            xaxis_cfg["range"] = [lo, hi]
+        if np.isfinite(lo) and np.isfinite(hi):
+            xaxis_cfg["range"] = [max(0.0, lo), max(lo + 1e-6, hi)]
 
     yaxis_cfg: dict[str, Any] = dict(gridcolor="rgba(255,255,255,0.08)", title="-log10(LDA Probability)")
     if yaxis_range is not None:
@@ -1904,7 +1914,7 @@ def main() -> None:
             st.radio(
                 "Experiment",
                 options=inv_keys,
-                format_func=lambda kk: labels.get(kk, kk),
+                format_func=lambda kk: _friendly_experiment_label(kk, meta_lookup.get(kk, {})),
                 key="investigator_dataset_pick",
             )
             picked = str(st.session_state.get("investigator_dataset_pick", inv_keys[0]))
@@ -1952,19 +1962,20 @@ def main() -> None:
             st.selectbox(
                 "Jump to matching dataset",
                 options=matching,
-                format_func=lambda k: labels.get(k, k),
+                format_func=lambda k: _friendly_experiment_label(k, meta_lookup.get(k, {})),
                 key="subunit_jump_dataset",
             )
+            jump_fk = str(st.session_state.get("subunit_jump_dataset", matching[0]))
+            if jump_fk != st.session_state.get(ACTIVE_DATASET_PICK_KEY):
+                st.session_state[ACTIVE_DATASET_PICK_KEY] = jump_fk
+                st.cache_data.clear()
+                st.rerun()
 
     if st.session_state.pop(_DATASET_SWITCH_RERUN_KEY, False):
         st.cache_data.clear()
         st.rerun()
 
-    # Subunit jump overrides investigator-picked active dataset when matches exist.
-    if matching:
-        selected_dataset = str(st.session_state.get("subunit_jump_dataset", dataset_keys_all[0]))
-    else:
-        selected_dataset = str(st.session_state.get(ACTIVE_DATASET_PICK_KEY, dataset_keys_all[0]))
+    selected_dataset = str(st.session_state.get(ACTIVE_DATASET_PICK_KEY, dataset_keys_all[0]))
 
     try:
         df_gene = aggregated_by_file[selected_dataset]
