@@ -205,18 +205,26 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
 
 def parse_filename_fuzzy(stem: str) -> tuple[Optional[str], Optional[str], str]:
     """
-    Preferred format: [Session]_[ID]_[Initials]_[CellLine]_[Bait]_[Rep...]
-    Returns (session_id, initials, label). Fallback keeps file visible.
+    Label-agnostic parsing:
+    - Session_ID: first two numeric blocks found left-to-right.
+    - Initials: third underscore block when present.
+    - Sample Label: everything after initials.
     """
     parts = [p for p in str(stem).split("_") if p != ""]
     if not parts:
         return None, None, ""
-    if len(parts) >= 6:
-        session_id = f"{parts[0]}_{parts[1]}"
-        initials = parts[2] if parts[2] else "Unknown"
-        label = "_".join(parts[3:]) if len(parts) > 3 else "Unknown"
-        return session_id, initials, label
-    return "Unknown", "Unknown", "_".join(parts)
+
+    nums: list[str] = []
+    for p in parts:
+        if p.isdigit():
+            nums.append(p)
+        if len(nums) == 2:
+            break
+    session_id = f"{nums[0]}_{nums[1]}" if len(nums) == 2 else "Unknown"
+
+    initials = parts[2] if len(parts) >= 3 and parts[2] else "Unknown"
+    label = "_".join(parts[3:]) if len(parts) >= 4 else stem
+    return session_id, initials, (label if str(label).strip() else stem)
 
 
 def extract_metadata_from_filename(filename: str) -> tuple[Optional[str], Optional[str], Optional[int]]:

@@ -1480,11 +1480,11 @@ def search_gene_across_datasets(
         rows.append(
             {
                 "Investigator": meta.get("investigator") or "Unknown",
-                "Bait": meta.get("bait") or "Unknown",
-                "Cell Line": meta.get("cell_line") or "Unknown",
-                "Exp ID": meta.get("session_id") or "Unknown",
+                "Session_ID": meta.get("session_id") or "Unknown",
+                "Sample Label": meta.get("label") or "Unknown",
                 "Spectral Count": row.get("Spectral Count"),
                 "Unique Peptides": row.get("Unique Peptides"),
+                "Avg LDA": row.get("Confidence Score"),
                 "_file_key": file_key,
             }
         )
@@ -1494,7 +1494,7 @@ def search_gene_across_datasets(
 
     out = pd.DataFrame(rows)
     out["Spectral Count"] = pd.to_numeric(out["Spectral Count"], errors="coerce")
-    out["Bait"] = out["Bait"].astype(str)
+    out["Avg LDA"] = pd.to_numeric(out["Avg LDA"], errors="coerce")
     out = out.sort_values("Spectral Count", ascending=False, kind="mergesort").reset_index(drop=True)
     return out
 
@@ -1517,21 +1517,23 @@ def _render_global_search_tab(
     aggregated_by_file: dict[str, pd.DataFrame],
     meta_by_file: dict[str, dict[str, Any]],
 ) -> None:
-    st.markdown("### Global Protein Search")
+    st.markdown("### Global Search")
     st.caption(
         "Search across all experiments using cached gene-level results (no extra file reads)."
     )
 
-    q = gene_input.strip()
+    q = st.text_input(
+        "Gene Symbol",
+        value=gene_input,
+        placeholder="e.g. ACTL6A, SMARCA4",
+        key="global_gene_query_tab",
+    ).strip()
+    st.session_state["global_gene_query"] = q
     if not q:
-        st.info("Enter a Gene Symbol in the sidebar under **Global Protein Search** to search the library.")
+        st.info("Enter a gene symbol to search across all experiments.")
         return
 
     results = search_gene_across_datasets(q, aggregated_by_file, meta_by_file)
-    baf_ip_only = st.checkbox("Filter for BAF-Core IPs only.", key="global_search_baf_ip_only")
-    if baf_ip_only and not results.empty:
-        results = results[results["Bait"].str.strip().str.upper().isin(BAF_SUBUNIT_SET)].copy()
-
     if results.empty:
         st.info(f"No detections found for **{q}** in current library.")
         return
@@ -1539,14 +1541,16 @@ def _render_global_search_tab(
     r_obs = results[results["Spectral Count"].fillna(0) > 0]
     max_sc = int(r_obs["Spectral Count"].max()) if not r_obs.empty and r_obs["Spectral Count"].notna().any() else 0
     top = results.iloc[0]
-    primary_bait = top.get("Bait", "N/A")
+    top_sid = top.get("Session_ID", "N/A")
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total Hits", f"{len(results)}")
     m2.metric("Highest Enrichment", f"{max_sc}")
-    m3.metric("Top Bait", str(primary_bait))
+    m3.metric("Top Session", str(top_sid))
 
-    df_show = results[["Investigator", "Bait", "Cell Line", "Exp ID", "Spectral Count", "Unique Peptides", "_file_key"]].copy()
+    df_show = results[
+        ["Investigator", "Session_ID", "Sample Label", "Spectral Count", "Unique Peptides", "Avg LDA", "_file_key"]
+    ].copy()
 
     st.markdown("#### Results")
     st.dataframe(
@@ -1560,7 +1564,7 @@ def _render_global_search_tab(
         fk = r.get("_file_key")
         if not fk:
             continue
-        ds_id = f"{r.get('Exp ID', 'Unknown')} | {r.get('Bait', 'Unknown')}"
+        ds_id = f"{r.get('Session_ID', 'Unknown')} | {r.get('Sample Label', 'Unknown')}"
         label = f"Open **{ds_id}**"
         if st.button(label, key=f"global_open_{fk}_{i}"):
             st.session_state[_PENDING_PORTAL_DATASET_KEY] = str(fk)
@@ -1891,23 +1895,33 @@ def main() -> None:
             dataset_keys_for_picker = dataset_keys_all
 
         st.markdown("#### Browse by Investigator")
-        browser_rows: list[dict[str, Any]] = []
+        by_inv: dict[str, list[str]] = defaultdict(list)
         for fk in dataset_keys_for_picker:
+            inv = str(meta_lookup.get(fk, {}).get("investigator") or "Unknown")
+            by_inv[inv].append(fk)
+        inv_options = sorted(by_inv.keys(), key=lambda s: s.lower())
+        if "browser_investigator" not in st.session_state or st.session_state["browser_investigator"] not in inv_options:
+            st.session_state["browser_investigator"] = inv_options[0] if inv_options else "Unknown"
+        st.selectbox("Investigator", options=inv_options, key="browser_investigator")
+        inv_selected = str(st.session_state.get("browser_investigator", inv_options[0] if inv_options else "Unknown"))
+        inv_keys = by_inv.get(inv_selected, [])
+
+        browser_rows: list[dict[str, Any]] = []
+        for fk in inv_keys:
             m = meta_lookup.get(fk, {})
             browser_rows.append(
                 {
-                    "Investigator": str(m.get("investigator") or "Unknown"),
-                    "Session ID": str(m.get("session_id") or "Unknown"),
-                    "Bait": str(m.get("bait") or "Unknown"),
-                    "Cell Line": str(m.get("cell_line") or "Unknown"),
-                    "Label": str(m.get("label") or "Unknown").replace(".csv", ""),
+                    "Session_ID": str(m.get("session_id") or "Unknown"),
+                    "Initials": str(m.get("initials") or "Unknown"),
+                    "Sample Label": str(m.get("label") or "Unknown").replace(".csv", ""),
+                    "Filename": str(m.get("filename") or fk.split("/")[-1]),
                     "_file_key": fk,
                 }
             )
         df_browser = pd.DataFrame(browser_rows)
         if not df_browser.empty:
             event = st.dataframe(
-                df_browser[["Investigator", "Session ID", "Bait", "Cell Line", "Label"]],
+                df_browser[["Session_ID", "Initials", "Sample Label", "Filename"]],
                 hide_index=True,
                 use_container_width=True,
                 on_select="rerun",
