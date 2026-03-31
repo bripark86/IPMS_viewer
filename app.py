@@ -692,6 +692,20 @@ def _log_prob_y_with_jitter(log_prob: pd.Series, gene_symbols: pd.Series) -> np.
     return y + jitter
 
 
+def _spectral_x_with_jitter(spectral: pd.Series, *, dataset_id: str) -> np.ndarray:
+    """Small X jitter (0.1-0.2) so low integer counts do not stack in vertical bands."""
+    x = spectral.astype(float).to_numpy()
+    if len(x) == 0:
+        return x
+    seed = abs(hash((dataset_id, tuple(np.round(x, 6).tolist())))) % (2**32 - 1)
+    rng = np.random.default_rng(seed)
+    amp = rng.uniform(0.1, 0.2, size=len(x))
+    sign = rng.choice(np.array([-1.0, 1.0]), size=len(x))
+    xj = x + sign * amp
+    xj = np.where(xj <= 0.01, x + amp, xj)
+    return xj
+
+
 def _normalize_total_spectral_column(df: pd.DataFrame) -> pd.DataFrame:
     """Return a copy with Spectral Count scaled to PPM (×1e6) of the run's total spectral count."""
     out = df.copy()
@@ -708,6 +722,7 @@ def _make_volcano_figure(
     active_dataset: pd.DataFrame,
     *,
     bait_gene: str | None,
+    dataset_id: str,
     force_log_x: bool | None = None,
     xaxis_range: tuple[float, float] | None = None,
     yaxis_range: tuple[float, float] | None = None,
@@ -742,6 +757,7 @@ def _make_volcano_figure(
 
     df = df.copy()
     df["Log_Prob_plot"] = _log_prob_y_with_jitter(df["Log_Prob"], df["Gene Symbol"])
+    df["Spectral Count_plot"] = _spectral_x_with_jitter(df["Spectral Count"], dataset_id=dataset_id)
 
     genes_u = df["Gene Symbol"].astype(str).str.strip().str.upper()
     bait_u = bait_gene.strip().upper() if bait_gene else None
@@ -786,7 +802,7 @@ def _make_volcano_figure(
             mk["symbol"] = symbol
         fig.add_trace(
             go.Scatter(
-                x=d["Spectral Count"],
+                x=d["Spectral Count_plot"],
                 y=d["Log_Prob_plot"],
                 mode="markers",
                 name=name,
@@ -847,6 +863,29 @@ def _make_volcano_figure(
         yaxis=yaxis_cfg,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+
+    # Label top 5 by spectral count and BAF genes above significance threshold.
+    top5 = df.sort_values(["Spectral Count", "Log_Prob"], ascending=[False, False]).head(5)
+    baf_sig = df[(df["is_baf_core"] == True) & (df["Log_Prob"] > 2.0)]
+    ann_df = pd.concat([top5, baf_sig], axis=0).drop_duplicates(subset=["Gene Symbol"], keep="first")
+    for _, r in ann_df.iterrows():
+        fig.add_annotation(
+            x=float(r["Spectral Count_plot"]),
+            y=float(r["Log_Prob_plot"]),
+            text=str(r["Gene Symbol"]),
+            showarrow=True,
+            arrowhead=1,
+            arrowsize=0.6,
+            arrowwidth=0.8,
+            arrowcolor="rgba(220,220,220,0.8)",
+            ax=14,
+            ay=-20,
+            font=dict(size=10, color="#E6EDF3"),
+            bgcolor="rgba(14,17,23,0.72)",
+            bordercolor="rgba(255,255,255,0.2)",
+            borderwidth=1,
+            borderpad=2,
+        )
 
     if (
         confidence_p_threshold is not None
@@ -1001,44 +1040,19 @@ def _correlation_heatmap_spectral(
 
 
 def draw_volcano_plot(
-    active_dataset_id: str,
     active_dataset: pd.DataFrame,
+    dataset_id: str,
     *,
     bait_gene: str | None,
-    df_baseline: pd.DataFrame | None,
-    log2_fc_threshold: float,
-    neg_log10_p_threshold: float,
-    n_top_labels: int,
-    lda_column_present: bool = True,
-) -> tuple[go.Figure, list[str]]:
-    """Publication FC volcano when LDA is valid; otherwise discovery scatter (spectral × unique peptides)."""
-    _ = active_dataset_id
-    msgs: list[str] = []
-    if not lda_column_present:
-        msgs.append(
-            "**Missing LDA Probability column in CSV** — `load_and_aggregate_csv` expects a resolvable header "
-            "such as `LDA Probability` with numeric values in **(0, 1]** (see `ipms_portal/data_processing.py`). "
-            "**Discovery view** is shown below (spectral count vs unique peptides)."
-        )
-    df_fc, _mode, prep_msgs = _prepare_volcano_foldchange_frame(
-        active_dataset, df_baseline, lda_column_present=lda_column_present
-    )
-    msgs.extend(prep_msgs)
-    if df_fc.empty:
-        if lda_column_present:
-            msgs.append(
-                "**No genes with valid LDA probability** — values may be missing, non-numeric, or outside (0, 1] "
-                "after gene-level aggregation. **Discovery view** is shown below."
-            )
-        return _make_discovery_volcano_figure(active_dataset, bait_gene=bait_gene), msgs
-    fig = _make_publication_volcano_figure(
-        df_fc,
+    confidence_p_threshold: float | None = VOLCANO_CONFIDENCE_P_CUTOFF,
+) -> go.Figure:
+    """Reactive discovery volcano (Spectral Count vs -log10(LDA Probability))."""
+    return _make_volcano_figure(
+        active_dataset,
         bait_gene=bait_gene,
-        log2_fc_threshold=log2_fc_threshold,
-        neg_log10_p_threshold=neg_log10_p_threshold,
-        n_top_labels=n_top_labels,
+        dataset_id=dataset_id,
+        confidence_p_threshold=confidence_p_threshold,
     )
-    return fig, msgs
 
 
 def draw_complex_coverage(active_dataset_id: str, active_dataset: pd.DataFrame) -> go.Figure:
@@ -1230,6 +1244,7 @@ def _render_comparative_analytics_tab(
             fig_a = _make_volcano_figure(
                 va,
                 bait_gene=bait_a,
+                dataset_id=f"cmp_{k_a}",
                 force_log_x=use_log_x,
                 xaxis_range=xr,
                 yaxis_range=yr,
@@ -1246,6 +1261,7 @@ def _render_comparative_analytics_tab(
             fig_b = _make_volcano_figure(
                 vb,
                 bait_gene=bait_b,
+                dataset_id=f"cmp_{k_b}",
                 force_log_x=use_log_x,
                 xaxis_range=xr,
                 yaxis_range=yr,
@@ -1880,36 +1896,8 @@ def main() -> None:
                 )
                 if st.button("Set as active dataset", key=f"inv_set_{safe}", type="primary"):
                     st.session_state[_PENDING_PORTAL_DATASET_KEY] = str(pick)
+                    st.cache_data.clear()
                     st.rerun()
-
-        st.markdown("---")
-        st.markdown("### Volcano plot (FC × significance)")
-        st.slider(
-            "Log2 |fold change| cutoff",
-            min_value=0.25,
-            max_value=3.0,
-            value=1.5,
-            step=0.05,
-            key="volcano_fc_threshold",
-            help="Dashed vertical lines at ±this Log2 fold change; quadrant coloring uses the same threshold.",
-        )
-        st.slider(
-            "−log10(LDA p) cutoff",
-            min_value=0.5,
-            max_value=15.0,
-            value=2.0,
-            step=0.05,
-            key="volcano_neglog10_p",
-            help="Dashed horizontal line (e.g. 2.0 ≈ p < 0.01 on average LDA probability).",
-        )
-        st.slider(
-            "Label top N enriched genes",
-            min_value=5,
-            max_value=15,
-            value=8,
-            step=1,
-            key="volcano_n_labels",
-        )
 
         st.markdown("---")
         st.markdown("### Comparative Analytics")
@@ -1955,6 +1943,7 @@ def main() -> None:
             )
 
     if st.session_state.pop(_DATASET_SWITCH_RERUN_KEY, False):
+        st.cache_data.clear()
         st.rerun()
 
     # Subunit jump overrides the main dataset picker when matches exist.
@@ -1985,6 +1974,26 @@ def main() -> None:
     active_df: pd.DataFrame = st.session_state[ACTIVE_DF_STATE_KEY]
 
     bait_gene_for_volcano = _infer_bait_gene_for_volcano(meta_by_file.get(selected_dataset, {}))
+    with st.sidebar:
+        bait_opts = sorted(set(list(BAF_SUBUNITS) + ([bait_gene_for_volcano] if bait_gene_for_volcano else [])))
+        bait_opts = [b for b in bait_opts if b]
+        bait_opts = ["Auto (inferred)"] + bait_opts + ["None"]
+        idx0 = 0
+        if bait_gene_for_volcano and bait_gene_for_volcano in bait_opts:
+            idx0 = bait_opts.index(bait_gene_for_volcano)
+        bait_pick = st.selectbox(
+            "Confirm/Select Bait",
+            options=bait_opts,
+            index=idx0,
+            key=f"bait_confirm_{selected_dataset}",
+            help="Override inferred bait when filename metadata is messy.",
+        )
+    if bait_pick == "Auto (inferred)":
+        bait_gene_for_volcano = bait_gene_for_volcano
+    elif bait_pick == "None":
+        bait_gene_for_volcano = None
+    else:
+        bait_gene_for_volcano = str(bait_pick).strip().upper()
 
     tab_main, tab_compare, tab_vault, tab_global, tab_batch = st.tabs(
         [
@@ -2007,41 +2016,21 @@ def main() -> None:
         c2.metric("BAF Subunits Found", f"{baf_detected}")
         c3.metric("Top Interactor", top_interactor if top_interactor else "NA")
 
-        st.markdown("### Volcano Plot (publication style)")
-        control_key = _auto_control_dataset_key(selected_dataset, dataset_keys_all, meta_by_file)
-        df_volc_baseline = aggregated_by_file.get(control_key) if control_key else None
-        if control_key:
-            st.caption(
-                f"**Baseline:** Mock/EV control in the same folder — `{labels.get(control_key, control_key)}`. "
-                "Log2 fold change uses **(spectral count + 1)** in bait vs control."
-            )
-        else:
-            st.caption(
-                "**Baseline:** mean spectral count in this IP (no Mock/EV CSV detected in the same investigator folder). "
-                "X-axis is **relative** log2 enrichment vs that mean (+1 pseudocount)."
-            )
+        st.markdown("### Volcano Plot")
+        meta_cur = meta_by_file.get(selected_dataset, {})
+        active_filename = str(meta_cur.get("filename") or selected_dataset.split("/")[-1])
+        st.caption(f"Showing data for: {active_filename} | Bait: {bait_gene_for_volcano or 'N/A'}")
 
-        vol_fc_thr = float(st.session_state.get("volcano_fc_threshold", 1.5))
-        vol_y_thr = float(st.session_state.get("volcano_neglog10_p", 2.0))
-        vol_n_lbl = int(st.session_state.get("volcano_n_labels", 8))
-        lda_csv_ok = bool(meta_by_file.get(selected_dataset, {}).get("lda_probability_column_in_csv", True))
-
-        fig_volc, vol_msgs = draw_volcano_plot(
-            selected_dataset,
+        fig_volc = draw_volcano_plot(
             active_df,
+            selected_dataset,
             bait_gene=bait_gene_for_volcano,
-            df_baseline=df_volc_baseline,
-            log2_fc_threshold=vol_fc_thr,
-            neg_log10_p_threshold=vol_y_thr,
-            n_top_labels=vol_n_lbl,
-            lda_column_present=lda_csv_ok,
+            confidence_p_threshold=VOLCANO_CONFIDENCE_P_CUTOFF,
         )
-        if vol_msgs:
-            st.warning("\n\n".join(vol_msgs))
         st.plotly_chart(
             fig_volc,
             use_container_width=True,
-            key=f"main_volcano_{selected_dataset}_{vol_fc_thr}_{vol_y_thr}_{vol_n_lbl}_{lda_csv_ok}",
+            key=f"main_volcano_{selected_dataset}_{bait_gene_for_volcano}",
         )
 
         st.markdown("### Complex Coverage (BAF Subunits Pulled Down)")
