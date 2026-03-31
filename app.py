@@ -136,14 +136,7 @@ def _meta_matches_bait(meta: dict[str, Any], bait_q: str) -> bool:
     q = bait_q.strip().upper()
     if not q:
         return False
-    if str(meta.get("bait", "")).upper() == q:
-        return True
-    if q in expand_biological_target_string(str(meta.get("biological_target", ""))):
-        return True
-    lab = str(meta.get("label", "")).upper()
-    if q in lab.split("_"):
-        return True
-    return False
+    return str(meta.get("bait", "")).upper() == q
 
 
 def _lab_consensus_table(
@@ -201,7 +194,7 @@ def _lab_consensus_table(
     if not rows:
         return pd.DataFrame()
     out = pd.DataFrame(rows)
-    out = out.sort_values(by=["Fraction of Runs", "Mean Spectral Count"], ascending=[False, False]).reset_index(
+    out = out.sort_values(by=["Mean Spectral Count", "Fraction of Runs"], ascending=[False, False]).reset_index(
         drop=True
     )
     return out
@@ -1481,10 +1474,11 @@ def search_gene_across_datasets(
             {
                 "Investigator": meta.get("investigator") or "Unknown",
                 "Session_ID": meta.get("session_id") or "Unknown",
+                "Bait": meta.get("bait") or "Unknown",
                 "Sample Label": meta.get("label") or "Unknown",
                 "Spectral Count": row.get("Spectral Count"),
                 "Unique Peptides": row.get("Unique Peptides"),
-                "Avg LDA": row.get("Confidence Score"),
+                "Avg Prob": row.get("Confidence Score"),
                 "_file_key": file_key,
             }
         )
@@ -1494,7 +1488,7 @@ def search_gene_across_datasets(
 
     out = pd.DataFrame(rows)
     out["Spectral Count"] = pd.to_numeric(out["Spectral Count"], errors="coerce")
-    out["Avg LDA"] = pd.to_numeric(out["Avg LDA"], errors="coerce")
+    out["Avg Prob"] = pd.to_numeric(out["Avg Prob"], errors="coerce")
     out = out.sort_values("Spectral Count", ascending=False, kind="mergesort").reset_index(drop=True)
     return out
 
@@ -1524,11 +1518,9 @@ def _render_global_search_tab(
 
     q = st.text_input(
         "Gene Symbol",
-        value=gene_input,
         placeholder="e.g. ACTL6A, SMARCA4",
         key="global_gene_query_tab",
     ).strip()
-    st.session_state["global_gene_query"] = q
     if not q:
         st.info("Enter a gene symbol to search across all experiments.")
         return
@@ -1541,15 +1533,15 @@ def _render_global_search_tab(
     r_obs = results[results["Spectral Count"].fillna(0) > 0]
     max_sc = int(r_obs["Spectral Count"].max()) if not r_obs.empty and r_obs["Spectral Count"].notna().any() else 0
     top = results.iloc[0]
-    top_sid = top.get("Session_ID", "N/A")
+    top_bait = top.get("Bait", "N/A")
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total Hits", f"{len(results)}")
     m2.metric("Highest Enrichment", f"{max_sc}")
-    m3.metric("Top Session", str(top_sid))
+    m3.metric("Top Bait", str(top_bait))
 
     df_show = results[
-        ["Investigator", "Session_ID", "Sample Label", "Spectral Count", "Unique Peptides", "Avg LDA", "_file_key"]
+        ["Investigator", "Bait", "Sample Label", "Spectral Count", "Avg Prob", "_file_key"]
     ].copy()
 
     st.markdown("#### Results")
@@ -1564,7 +1556,7 @@ def _render_global_search_tab(
         fk = r.get("_file_key")
         if not fk:
             continue
-        ds_id = f"{r.get('Session_ID', 'Unknown')} | {r.get('Sample Label', 'Unknown')}"
+        ds_id = f"{r.get('Bait', 'Unknown')} | {r.get('Sample Label', 'Unknown')}"
         label = f"Open **{ds_id}**"
         if st.button(label, key=f"global_open_{fk}_{i}"):
             st.session_state[_PENDING_PORTAL_DATASET_KEY] = str(fk)
@@ -1812,7 +1804,6 @@ def main() -> None:
     print(f"[IPMS Debug] App using Data root: {str(data_dir)!r}")
     print(f"[IPMS Debug] os.getcwd(): {os.getcwd()!r}")
 
-    st.title("BAF-Vault: IP-MS Encyclopedia")
 
     matching: list[str] = []
     with st.sidebar:
@@ -1911,17 +1902,18 @@ def main() -> None:
             m = meta_lookup.get(fk, {})
             browser_rows.append(
                 {
-                    "Session_ID": str(m.get("session_id") or "Unknown"),
+                    "Session ID": str(m.get("session_id") or "Unknown"),
                     "Initials": str(m.get("initials") or "Unknown"),
+                    "Bait": str(m.get("bait") or "Unknown"),
+                    "Cell Line": str(m.get("cell_line") or "Unknown"),
                     "Sample Label": str(m.get("label") or "Unknown").replace(".csv", ""),
-                    "Filename": str(m.get("filename") or fk.split("/")[-1]),
                     "_file_key": fk,
                 }
             )
         df_browser = pd.DataFrame(browser_rows)
         if not df_browser.empty:
             event = st.dataframe(
-                df_browser[["Session_ID", "Initials", "Sample Label", "Filename"]],
+                df_browser[["Session ID", "Initials", "Bait", "Cell Line", "Sample Label"]],
                 hide_index=True,
                 use_container_width=True,
                 on_select="rerun",
@@ -1964,15 +1956,6 @@ def main() -> None:
             format_func=lambda kk: labels.get(kk, kk),
             key="compare_analytics_pick",
             help="Two runs → **Comparative Analytics** tab shows side-by-side volcanoes + overlap table. Three or more → correlation heatmap.",
-        )
-
-        st.markdown("---")
-        st.markdown("### Global Protein Search")
-        st.text_input(
-            "Gene Symbol (all experiments)",
-            placeholder="e.g. ACTL6A, MYC",
-            key="global_gene_query",
-            help="Open the **Global Search** tab for the full cross-experiment table and metrics.",
         )
 
         st.markdown("---")

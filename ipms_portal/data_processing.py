@@ -10,6 +10,14 @@ import pandas as pd
 
 from ipms_portal.biological_aliases import infer_bait_gene_from_label, resolve_biological_fields
 
+BAF_SUBUNITS = {
+    "SMARCA4", "SMARCA2", "SMARCB1", "SMARCC1", "SMARCC2", "ARID1A", "ARID1B",
+    "ARID2", "PBRM1", "BRD7", "BRD9", "ACTL6A", "ACTL6B", "BCL7A", "BCL7B",
+    "BCL7C", "DPF1", "DPF2", "DPF3", "PHF10", "SS18", "SS18L1", "SMARCD1",
+    "SMARCD2", "SMARCD3", "GLTSCR1",
+}
+COMMON_CELL_LINES = {"K562", "MOLM13", "G401", "A549", "OCILY1"}
+
 
 @dataclass(frozen=True)
 class ExperimentMeta:
@@ -227,6 +235,26 @@ def parse_filename_fuzzy(stem: str) -> tuple[Optional[str], Optional[str], str]:
     return session_id, initials, (label if str(label).strip() else stem)
 
 
+def _parse_label_heuristics(label: str) -> tuple[str, str | None, str | None]:
+    toks = [t for t in str(label).split("_") if t]
+    if not toks:
+        return "Unknown", None, None
+    bait = None
+    cell = None
+    kept: list[str] = []
+    for tok in toks:
+        up = tok.strip().upper()
+        if bait is None and up in BAF_SUBUNITS:
+            bait = up
+            continue
+        if cell is None and up in COMMON_CELL_LINES:
+            cell = up
+            continue
+        kept.append(tok)
+    sample_label = "_".join(kept) if kept else "_".join(toks)
+    return sample_label, bait, cell
+
+
 def extract_metadata_from_filename(filename: str) -> tuple[Optional[str], Optional[str], Optional[int]]:
     """
     Back-compat shim: approximate (cell_line, bait, replicate) from fuzzy label.
@@ -312,18 +340,8 @@ def enrich_meta_dict(meta: ExperimentMeta) -> dict[str, object]:
     inv_s = meta.investigator if meta.investigator else None
     label = meta.label or ""
     stem = meta.filename[: -len(".csv")] if meta.filename.lower().endswith(".csv") else meta.filename
-    stem_parts = [p for p in str(stem).split("_") if p]
-    bait_from_name = None
-    cell_line = None
-    if len(stem_parts) >= 6:
-        cell_line = stem_parts[3]
-        bait_from_name = stem_parts[4]
-    elif label:
-        toks = label.split("_")
-        if toks and toks[0]:
-            cell_line = toks[0]
-
-    bait_guess = bait_from_name or infer_bait_gene_from_label(meta.label, stem)
+    sample_label, bait_from_name, cell_line = _parse_label_heuristics(label)
+    bait_guess = bait_from_name or infer_bait_gene_from_label(sample_label, stem)
     bio, domain, disp_bait = resolve_biological_fields(meta.label, stem, bait_gene_guess=bait_guess)
 
     return {
@@ -335,7 +353,7 @@ def enrich_meta_dict(meta: ExperimentMeta) -> dict[str, object]:
         "investigator": inv_s,
         "session_id": meta.session_id or "Unknown",
         "initials": meta.initials or "Unknown",
-        "label": meta.label or "Unknown",
+        "label": sample_label or "Unknown",
         "cell_line": cell_line,
         "bait": disp_bait if disp_bait != "N/A" else (bait_guess or "Unknown"),
         "replicate": None,
