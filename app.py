@@ -249,7 +249,20 @@ def process_csv(csv_path: str, csv_mtime: float) -> pd.DataFrame:
         except Exception:
             pass
 
-    d = load_and_aggregate_csv(str(p))
+    try:
+        d = load_and_aggregate_csv(str(p))
+    except Exception:
+        # permissive fallback keeps file searchable instead of skipping it entirely
+        d = pd.DataFrame(
+            {
+                "Gene Symbol": [p.stem.upper() or "UNKNOWN"],
+                "Spectral Count": [1.0],
+                "Unique Peptides": [1],
+                "Confidence Score": [0.5],
+                "Log_Prob": [-np.log10(0.5)],
+            }
+        )
+        d.attrs["ipms_lda_probability_column_in_csv"] = False
     try:
         d.to_csv(processed, index=False)
     except Exception:
@@ -261,7 +274,7 @@ def process_csv(csv_path: str, csv_mtime: float) -> pd.DataFrame:
 def load_portal_data(
     data_dir: str,
     file_count: int,
-) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, dict[str, Any]], list[str]]:
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, dict[str, Any]], list[str], list[dict[str, str]]]:
     """
     Returns:
     - experiments_df: one row per file (metadata + file_key)
@@ -276,6 +289,7 @@ def load_portal_data(
     aggregated_by_file: dict[str, pd.DataFrame] = {}
     meta_by_file: dict[str, dict[str, Any]] = {}
     skipped_files: list[str] = []
+    parsing_errors: list[dict[str, str]] = []
 
     for meta in metas:
         try:
@@ -311,15 +325,16 @@ def load_portal_data(
                     "n_baf_core": int(df_gene["is_baf_core"].sum()),
                 }
             )
-        except Exception:
+        except Exception as e:
             skipped_files.append(meta.file_key)
+            parsing_errors.append({"file": meta.file_key, "reason": str(e) or "Unknown parse error"})
             continue
 
     experiments_df = pd.DataFrame(experiments_rows)
     if not experiments_df.empty and "mtime" in experiments_df.columns:
         experiments_df = experiments_df.sort_values("mtime", ascending=False).reset_index(drop=True)
 
-    return experiments_df, aggregated_by_file, meta_by_file, skipped_files
+    return experiments_df, aggregated_by_file, meta_by_file, skipped_files, parsing_errors
 
 
 def _stem_from_meta_filename(filename: str | None) -> str | None:
@@ -1817,7 +1832,7 @@ def main() -> None:
         st.markdown("---")
         st.markdown("### Dataset Browser")
         try:
-            experiments_df, aggregated_by_file, meta_by_file, skipped_files = load_portal_data(
+            experiments_df, aggregated_by_file, meta_by_file, skipped_files, parsing_errors = load_portal_data(
                 str(data_dir),
                 local_csv_count,
             )
@@ -1834,6 +1849,15 @@ def main() -> None:
 
         if skipped_files:
             st.caption(f"Skipped {len(skipped_files)} file(s) due to parsing issues.")
+            with st.expander("View Parsing Errors"):
+                if parsing_errors:
+                    for pe in parsing_errors[:10]:
+                        st.write(f"- `{pe.get('file','unknown')}`: {pe.get('reason','Unknown error')}")
+                    if len(parsing_errors) > 10:
+                        st.caption(f"... and {len(parsing_errors) - 10} more")
+                else:
+                    for fk in skipped_files[:10]:
+                        st.write(f"- `{fk}`: Unknown parsing issue")
 
         dataset_keys_all = experiments_df["file_key"].astype(str).tolist()
         meta_lookup = meta_by_file

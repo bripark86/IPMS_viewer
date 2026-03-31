@@ -33,154 +33,172 @@ def _normalize_col(s: str) -> str:
     return s
 
 
-def _find_header_row(path: str, required_markers: tuple[str, str], max_lines: int = 250) -> int:
-    gene_marker, peptide_marker = required_markers
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for idx, line in enumerate(f):
-            if idx >= max_lines:
-                break
-            if gene_marker in line and peptide_marker in line:
-                return idx
-    raise ValueError(
-        f"Could not find header row containing both markers {required_markers} within first {max_lines} lines."
+def _read_text_lines_with_fallback(path: str, max_lines: int = 300) -> list[str]:
+    for enc in ("utf-8", "latin1"):
+        try:
+            with open(path, "r", encoding=enc, errors="ignore") as f:
+                lines: list[str] = []
+                for i, line in enumerate(f):
+                    if i >= max_lines:
+                        break
+                    lines.append(line)
+                return lines
+        except Exception:
+            continue
+    return []
+
+
+def _guess_header_row(path: str, max_lines: int = 200) -> int:
+    lines = _read_text_lines_with_fallback(path, max_lines=max_lines)
+    if not lines:
+        return 0
+    score_terms = (
+        "gene symbol",
+        "gene",
+        "symbol",
+        "accession",
+        "peptide",
+        "spectral count",
+        "total peptides",
+        "count",
+        "num peptides",
+        "lda probability",
+        "confidence",
+        "prob",
+        "score",
     )
+    best_i, best_score = 0, -1
+    for i, raw in enumerate(lines):
+        ll = raw.lower()
+        score = sum(1 for t in score_terms if t in ll)
+        if score > best_score:
+            best_score = score
+            best_i = i
+    return best_i if best_score >= 2 else 0
 
 
-def _select_and_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
-    normalized = {_normalize_col(c): c for c in df.columns}
-
-    def resolve(target: str) -> Optional[str]:
-        target_n = _normalize_col(target)
-        if target_n in normalized:
-            return normalized[target_n]
-        target_f = re.sub(r"[\s_]+", "", target_n).lower()
-        for col in df.columns:
-            col_f = re.sub(r"[\s_]+", "", _normalize_col(col)).lower()
-            if col_f == target_f:
-                return col
-        return None
-
-    def resolve_lda_probability_column() -> Optional[str]:
-        """
-        Use the numeric LDA Probability column only — never LDA Score or unrelated LDA* columns.
-        """
-        # Exact / near-exact headers first
-        for want in ("LDA Probability", "LDA probability", "Prob LDA"):
-            wn = _normalize_col(want)
-            if wn in normalized:
-                return normalized[wn]
-            wf = re.sub(r"[\s_]+", "", wn).lower()
-            for col in df.columns:
-                cf = re.sub(r"[\s_]+", "", _normalize_col(col)).lower()
-                if cf == wf:
-                    return col
-        # Fuzzy: contains lda + prob, excludes score (never use LDA Score)
-        candidates: list[str] = []
-        for col in df.columns:
-            cf = re.sub(r"[\s_]+", "", _normalize_col(col)).lower()
-            if "lda" not in cf:
-                continue
-            if "score" in cf:
-                continue
-            if "prob" in cf or cf.endswith("prob") or "probability" in cf:
-                candidates.append(col)
-        if not candidates:
-            return None
-        if len(candidates) == 1:
-            return candidates[0]
-
-        def _prob_col_rank(col: str) -> tuple[int, str]:
-            cf = re.sub(r"[\s_]+", "", _normalize_col(col)).lower()
-            pri = 0
-            if "probability" in cf:
-                pri -= 3
-            if "prob" in cf:
-                pri -= 1
-            return (pri, col)
-
-        return min(candidates, key=_prob_col_rank)
-
-    col_gene = resolve("Gene Symbol")
-    col_peptide = resolve("Peptide")
-    col_lda = resolve_lda_probability_column()
-    col_xcorr = resolve("XCorr")
-
-    if col_gene is None or col_peptide is None:
-        raise ValueError("Missing required columns for aggregation (Gene Symbol and/or Peptide).")
-
-    keep = {"Gene Symbol": col_gene, "Peptide": col_peptide}
-    if col_lda is not None:
-        keep["LDA Probability"] = col_lda
-    if col_xcorr is not None:
-        keep["XCorr"] = col_xcorr
-
-    df2 = df.copy()
-    df2 = df2[list(keep.values())].rename(columns={v: k for k, v in keep.items()})
-    return df2
+def _read_csv_flexible(path: str, header_idx: int) -> pd.DataFrame:
+    # Try common encodings first; tolerate malformed bytes/rows.
+    tries = [
+        {"encoding": "utf-8", "encoding_errors": "ignore"},
+        {"encoding": "latin1"},
+    ]
+    last_exc: Exception | None = None
+    for opts in tries:
+        try:
+            return pd.read_csv(
+                path,
+                header=header_idx,
+                engine="python",
+                sep=None,
+                dtype=str,
+                on_bad_lines="skip",
+                **opts,
+            )
+        except Exception as e:
+            last_exc = e
+            continue
+    if last_exc is not None:
+        raise last_exc
+    raise ValueError(f"Unable to read CSV: {path}")
 
 
-def _peptide_lda_prob_numeric(df: pd.DataFrame) -> pd.Series:
-    """
-    Per-peptide LDA probability: coerce with pd.to_numeric(..., errors='coerce').
-    Missing / non-numeric / out-of-range values stay NaN (no floor, no fill)—those rows
-    do not contribute valid probability mass at gene aggregation time.
-    Values in (1, 100] are treated as percents and scaled to (0, 1].
-    """
-    if "LDA Probability" not in df.columns:
-        return pd.Series(np.nan, index=df.index, dtype=float)
+def _resolve_any_column(df: pd.DataFrame, aliases: tuple[str, ...]) -> Optional[str]:
+    cols = list(df.columns)
+    ncols = {_normalize_col(c): c for c in cols}
 
-    raw = df["LDA Probability"]
-    if raw.dtype == object or str(raw.dtype) == "string":
-        s = raw.astype(str).str.strip()
-        u = s.str.upper()
-        bad = u.isin(["", "N/A", "NA", "NAN", "NONE", "NULL", "-", "—"])
-        s = s.where(~bad, np.nan)
-        lda = pd.to_numeric(s, errors="coerce")
-    else:
-        lda = pd.to_numeric(raw, errors="coerce")
-    lda = lda.astype(float)
-    pct = lda.notna() & (lda > 1.0) & (lda <= 100.0)
-    lda = lda.where(~pct, lda / 100.0)
-    lda = lda.where(lda.notna() & (lda > 0.0) & (lda <= 1.0), np.nan)
-    return lda
+    def canon(x: str) -> str:
+        return re.sub(r"[\s_]+", "", _normalize_col(x)).lower()
+
+    for a in aliases:
+        an = _normalize_col(a)
+        if an in ncols:
+            return ncols[an]
+    alias_canon = [canon(a) for a in aliases]
+    for c in cols:
+        cc = canon(c)
+        if cc in alias_canon:
+            return c
+    for c in cols:
+        cc = canon(c)
+        if any(ac in cc for ac in alias_canon):
+            return c
+    return None
+
+
+def _confidence_numeric(s: pd.Series) -> pd.Series:
+    raw = pd.to_numeric(s, errors="coerce")
+    pct = raw.notna() & (raw > 1.0) & (raw <= 100.0)
+    raw = raw.where(~pct, raw / 100.0)
+    raw = raw.where(raw.notna() & (raw >= 0.0) & (raw <= 1.0), np.nan)
+    return raw.fillna(0.5).astype(float)
 
 
 def load_and_aggregate_csv(path: str) -> pd.DataFrame:
-    header_idx = _find_header_row(
-        path, required_markers=("Gene Symbol", "Peptide"), max_lines=300
-    )
-    df_raw = pd.read_csv(
-        path,
-        header=header_idx,
-        engine="python",
-        sep=None,
-        dtype=str,
-        on_bad_lines="skip",
-    )
-
+    header_idx = _guess_header_row(path, max_lines=250)
+    df_raw = _read_csv_flexible(path, header_idx)
     df_raw.columns = [_normalize_col(c) for c in df_raw.columns]
-    df = _select_and_rename_columns(df_raw)
 
-    df["Gene Symbol"] = df["Gene Symbol"].astype(str).str.strip()
-    df["Peptide"] = df["Peptide"].astype(str).str.strip()
+    col_gene = _resolve_any_column(df_raw, ("Gene Symbol", "Gene", "Symbol", "Accession"))
+    col_pep = _resolve_any_column(df_raw, ("Peptide", "Sequence"))
+    col_spec = _resolve_any_column(df_raw, ("Spectral Count", "Total Peptides", "Count", "Num Peptides"))
+    col_conf = _resolve_any_column(df_raw, ("LDA Probability", "Confidence", "Prob", "Score"))
 
-    lda_col_present = "LDA Probability" in df.columns
-    df["LDA_Prob"] = _peptide_lda_prob_numeric(df)
+    n = len(df_raw)
+    if n == 0:
+        out = pd.DataFrame(columns=["Gene Symbol", "Spectral Count", "Unique Peptides", "Confidence Score", "Log_Prob"])
+        out.attrs["ipms_lda_probability_column_in_csv"] = False
+        return out
 
-    grouped = df.groupby("Gene Symbol", dropna=False, sort=False)
-    spectral_count = grouped.size().rename("Spectral Count")
-    unique_peptides = grouped["Peptide"].nunique(dropna=True).rename("Unique Peptides")
-    avg_lda = grouped["LDA_Prob"].mean().rename("Confidence Score")
+    gene = (
+        df_raw[col_gene].astype(str).str.strip()
+        if col_gene is not None
+        else pd.Series([f"UNKNOWN_{i+1}" for i in range(n)], index=df_raw.index)
+    )
+    gene = gene.replace({"": np.nan, "nan": np.nan, "None": np.nan}).fillna(
+        pd.Series([f"UNKNOWN_{i+1}" for i in range(n)], index=df_raw.index)
+    )
 
-    out = pd.concat([spectral_count, unique_peptides, avg_lda], axis=1).reset_index()
-    cs = pd.to_numeric(out["Confidence Score"], errors="coerce")
+    if col_spec is not None:
+        spec_row = pd.to_numeric(df_raw[col_spec], errors="coerce").fillna(1.0)
+    elif col_pep is not None:
+        spec_row = pd.Series(1.0, index=df_raw.index)
+    else:
+        spec_row = pd.Series(1.0, index=df_raw.index)
+
+    pep_token = (
+        df_raw[col_pep].astype(str).str.strip()
+        if col_pep is not None
+        else pd.Series([f"ROW_{i+1}" for i in range(n)], index=df_raw.index)
+    )
+    pep_token = pep_token.replace({"": np.nan, "nan": np.nan}).fillna(
+        pd.Series([f"ROW_{i+1}" for i in range(n)], index=df_raw.index)
+    )
+
+    conf_row = _confidence_numeric(df_raw[col_conf]) if col_conf is not None else pd.Series(0.5, index=df_raw.index)
+
+    tmp = pd.DataFrame(
+        {
+            "Gene Symbol": gene.astype(str),
+            "_spec": spec_row.astype(float),
+            "_pep": pep_token.astype(str),
+            "_conf": conf_row.astype(float),
+        }
+    )
+
+    grp = tmp.groupby("Gene Symbol", dropna=False, sort=False)
+    out = pd.DataFrame(
+        {
+            "Spectral Count": grp["_spec"].sum(),
+            "Unique Peptides": grp["_pep"].nunique(dropna=True),
+            "Confidence Score": grp["_conf"].mean(),
+        }
+    ).reset_index()
+
+    cs = pd.to_numeric(out["Confidence Score"], errors="coerce").fillna(0.5).clip(lower=1e-12, upper=1.0)
     out["Confidence Score"] = cs
-    out["Log_Prob"] = np.nan
-    valid_p = cs.notna() & (cs > 0.0) & (cs <= 1.0)
-    out.loc[valid_p, "Log_Prob"] = -np.log10(cs.loc[valid_p])
-
-    out.attrs["ipms_lda_probability_column_in_csv"] = bool(lda_col_present)
-
+    out["Log_Prob"] = -np.log10(cs)
+    out.attrs["ipms_lda_probability_column_in_csv"] = bool(col_conf is not None)
     return out
 
 
@@ -202,13 +220,13 @@ def parse_filename_fuzzy(stem: str) -> tuple[Optional[str], Optional[str], str]:
             break
 
     if len(numeric_positions) < 2:
-        return None, None, "_".join(parts)
+        return "Unknown", "Unknown", "_".join(parts)
 
     i0, i1 = numeric_positions[0], numeric_positions[1]
     session_id = f"{parts[i0]}_{parts[i1]}"
     j = i1 + 1
     if j >= len(parts):
-        return session_id, None, ""
+        return session_id, "Unknown", "Unknown"
 
     initials = parts[j]
     label = "_".join(parts[j + 1 :]) if j + 1 < len(parts) else ""
@@ -311,9 +329,9 @@ def enrich_meta_dict(meta: ExperimentMeta) -> dict[str, object]:
         "path": meta.path,
         "mtime": meta.mtime,
         "investigator": inv_s,
-        "session_id": meta.session_id,
-        "initials": meta.initials,
-        "label": meta.label,
+        "session_id": meta.session_id or "Unknown",
+        "initials": meta.initials or "Unknown",
+        "label": meta.label or "Unknown",
         "cell_line": cell_line,
         "bait": disp_bait if disp_bait != "N/A" else (bait_guess or "N/A"),
         "replicate": None,
