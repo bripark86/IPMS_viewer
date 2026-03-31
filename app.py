@@ -34,6 +34,7 @@ DATA_ROOT = pathlib.Path(__file__).parent.resolve() / "Data"
 _PENDING_PORTAL_DATASET_KEY = "_pending_portal_dataset"
 ACTIVE_DATASET_STATE_KEY = "active_dataset_id"
 ACTIVE_DF_STATE_KEY = "active_df"
+ACTIVE_DATASET_PICK_KEY = "active_dataset"
 _DATASET_SWITCH_RERUN_KEY = "_dataset_switch_rerun"
 CURRENT_PROJECT_BAITS = {"BCL7A", "BCL7B", "BCL7C", "SMARCE1"}
 # Horizontal reference line on volcano: y = -log10(p); change here or wire to UI later.
@@ -1073,6 +1074,7 @@ def draw_complex_coverage(active_dataset_id: str, active_dataset: pd.DataFrame) 
 
     merged["present"] = merged["Spectral Count"] > 0
     merged["color"] = np.where(merged["present"], BAF_CORE_COLOR, "rgba(120,120,120,0.35)")
+    merged = merged.sort_values("Spectral Count", ascending=False, kind="mergesort")
 
     fig = go.Figure(
         go.Bar(
@@ -1090,7 +1092,7 @@ def draw_complex_coverage(active_dataset_id: str, active_dataset: pd.DataFrame) 
         margin=dict(l=180, r=10, t=30, b=30),
         xaxis_title="Spectral Count",
         yaxis_title="",
-        yaxis=dict(tickfont=dict(size=11), categoryorder="array", categoryarray=list(BAF_SUBUNITS)),
+        yaxis=dict(tickfont=dict(size=11), autorange="reversed", categoryorder="array", categoryarray=merged["Gene Symbol"].astype(str).tolist()),
         title=dict(text="BAF complex coverage (0 = not detected)", font=dict(size=14)),
     )
     return fig
@@ -1759,9 +1761,6 @@ def main() -> None:
     print(f"[IPMS Debug] os.getcwd(): {os.getcwd()!r}")
 
     st.title("BAF-Vault: IP-MS Encyclopedia")
-    st.caption(
-        "Nested `Data/[Investigator]/` repository with peptide→gene aggregation, SWIFT alias mapping, and lab-scale search."
-    )
 
     matching: list[str] = []
     with st.sidebar:
@@ -1770,7 +1769,6 @@ def main() -> None:
         if "data_refresh_token" not in st.session_state:
             st.session_state["data_refresh_token"] = 0
         st.markdown("### Data Directory & File Management")
-        st.caption(f"Local data: `{str(data_dir)}` (use `Data/[Investigator]/file.csv`)")
 
         upload_subfolder = st.text_input(
             "Upload subfolder under Data/",
@@ -1837,7 +1835,7 @@ def main() -> None:
             pending_fk = st.session_state.pop(_PENDING_PORTAL_DATASET_KEY)
             if pending_fk and str(pending_fk) in dataset_keys_all:
                 st.session_state["portal_project_view"] = "All Experiments"
-                st.session_state["portal_dataset_select"] = str(pending_fk)
+                st.session_state[ACTIVE_DATASET_PICK_KEY] = str(pending_fk)
                 st.session_state[_DATASET_SWITCH_RERUN_KEY] = True
             elif pending_fk:
                 st.warning(f"Could not switch active dataset (not in library): {pending_fk!r}")
@@ -1865,39 +1863,55 @@ def main() -> None:
         dataset_keys_for_picker = (
             current_project_keys if project_view == "Current Projects" else dataset_keys_all
         )
-
         if not dataset_keys_for_picker:
             dataset_keys_for_picker = dataset_keys_all
 
-        ds_cur = st.session_state.get("portal_dataset_select")
-        if ds_cur not in dataset_keys_for_picker and dataset_keys_for_picker:
-            st.session_state["portal_dataset_select"] = dataset_keys_for_picker[0]
-
-        st.selectbox(
-            "Select dataset",
-            options=dataset_keys_for_picker,
-            format_func=lambda k: labels.get(k, k),
-            key="portal_dataset_select",
-        )
-
         st.markdown("#### Browse by Investigator")
         by_inv: dict[str, list[str]] = defaultdict(list)
-        for fk in dataset_keys_all:
+        for fk in dataset_keys_for_picker:
             inv = str(meta_lookup.get(fk, {}).get("investigator") or "N/A")
             by_inv[inv].append(fk)
-        for inv in sorted(by_inv.keys(), key=lambda s: (s == "N/A", s.lower())):
-            safe = str(inv).replace("/", "_").replace(" ", "_")[:48]
-            with st.expander(f"{inv} ({len(by_inv[inv])})"):
-                pick = st.selectbox(
-                    "Experiments",
-                    options=sorted(by_inv[inv]),
-                    key=f"inv_pick_{safe}",
-                    format_func=lambda kk: labels.get(kk, kk),
-                )
-                if st.button("Set as active dataset", key=f"inv_set_{safe}", type="primary"):
-                    st.session_state[_PENDING_PORTAL_DATASET_KEY] = str(pick)
-                    st.cache_data.clear()
-                    st.rerun()
+        inv_options = sorted(by_inv.keys(), key=lambda s: (s == "N/A", s.lower()))
+        if "browser_investigator" not in st.session_state or st.session_state["browser_investigator"] not in inv_options:
+            st.session_state["browser_investigator"] = inv_options[0] if inv_options else "N/A"
+
+        st.selectbox("Investigator", options=inv_options, key="browser_investigator")
+        inv_selected = str(st.session_state.get("browser_investigator", inv_options[0] if inv_options else "N/A"))
+        inv_keys = sorted(by_inv.get(inv_selected, []))
+
+        inv_rows: list[dict[str, Any]] = []
+        for fk in inv_keys:
+            m = meta_lookup.get(fk, {})
+            inv_rows.append(
+                {
+                    "Dataset": fk,
+                    "Date": pd.to_datetime(float(m.get("mtime", 0.0)), unit="s", errors="coerce"),
+                    "Bait": m.get("bait") or "N/A",
+                    "Label": m.get("label") or "N/A",
+                    "Filename": m.get("filename") or fk.split("/")[-1],
+                }
+            )
+        df_inv = pd.DataFrame(inv_rows)
+        if not df_inv.empty:
+            st.dataframe(df_inv[["Filename", "Date", "Bait", "Label", "Dataset"]], use_container_width=True, height=min(280, 72 + 28 * len(df_inv)))
+
+        if inv_keys:
+            active_cur = st.session_state.get(ACTIVE_DATASET_PICK_KEY)
+            if active_cur not in inv_keys:
+                st.session_state[ACTIVE_DATASET_PICK_KEY] = inv_keys[0]
+            if st.session_state.get("investigator_dataset_pick") not in inv_keys:
+                st.session_state["investigator_dataset_pick"] = inv_keys[0]
+            st.radio(
+                "Experiment",
+                options=inv_keys,
+                format_func=lambda kk: labels.get(kk, kk),
+                key="investigator_dataset_pick",
+            )
+            picked = str(st.session_state.get("investigator_dataset_pick", inv_keys[0]))
+            if picked != st.session_state.get(ACTIVE_DATASET_PICK_KEY):
+                st.session_state[ACTIVE_DATASET_PICK_KEY] = picked
+                st.cache_data.clear()
+                st.rerun()
 
         st.markdown("---")
         st.markdown("### Comparative Analytics")
@@ -1946,11 +1960,11 @@ def main() -> None:
         st.cache_data.clear()
         st.rerun()
 
-    # Subunit jump overrides the main dataset picker when matches exist.
+    # Subunit jump overrides investigator-picked active dataset when matches exist.
     if matching:
         selected_dataset = str(st.session_state.get("subunit_jump_dataset", dataset_keys_all[0]))
     else:
-        selected_dataset = str(st.session_state.get("portal_dataset_select", dataset_keys_all[0]))
+        selected_dataset = str(st.session_state.get(ACTIVE_DATASET_PICK_KEY, dataset_keys_all[0]))
 
     try:
         df_gene = aggregated_by_file[selected_dataset]
@@ -1970,6 +1984,8 @@ def main() -> None:
             icon="📊",
         )
     st.session_state[ACTIVE_DATASET_STATE_KEY] = selected_dataset
+    st.session_state[ACTIVE_DATASET_PICK_KEY] = selected_dataset
+    st.session_state["active_filename"] = str(meta_by_file.get(selected_dataset, {}).get("filename") or selected_dataset.split("/")[-1])
     st.session_state[ACTIVE_DF_STATE_KEY] = df_gene.copy()
     active_df: pd.DataFrame = st.session_state[ACTIVE_DF_STATE_KEY]
 
@@ -2016,10 +2032,7 @@ def main() -> None:
         c2.metric("BAF Subunits Found", f"{baf_detected}")
         c3.metric("Top Interactor", top_interactor if top_interactor else "NA")
 
-        st.markdown("### Volcano Plot")
-        meta_cur = meta_by_file.get(selected_dataset, {})
-        active_filename = str(meta_cur.get("filename") or selected_dataset.split("/")[-1])
-        st.caption(f"Showing data for: {active_filename} | Bait: {bait_gene_for_volcano or 'N/A'}")
+        st.subheader(f"Volcano Plot: {st.session_state['active_filename']}")
 
         fig_volc = draw_volcano_plot(
             active_df,
