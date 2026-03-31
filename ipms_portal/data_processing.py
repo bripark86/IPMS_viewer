@@ -10,6 +10,8 @@ import pandas as pd
 
 from ipms_portal.biological_aliases import infer_bait_gene_from_label, resolve_biological_fields
 
+pd.set_option("future.no_silent_downcasting", True)
+
 BAF_SUBUNITS = {
     "SMARCA4", "SMARCA2", "SMARCB1", "SMARCC1", "SMARCC2", "ARID1A", "ARID1B",
     "ARID2", "PBRM1", "BRD7", "BRD9", "ACTL6A", "ACTL6B", "BCL7A", "BCL7B",
@@ -163,10 +165,8 @@ def load_and_aggregate_csv(path: str) -> pd.DataFrame:
         if col_gene is not None
         else pd.Series([f"UNKNOWN_{i+1}" for i in range(n)], index=df_raw.index)
     )
-    gene = gene.replace({"": np.nan, "nan": np.nan, "None": np.nan})
-    gene = gene.infer_objects(copy=False).fillna(
-        pd.Series([f"UNKNOWN_{i+1}" for i in range(n)], index=df_raw.index)
-    )
+    gene = gene.replace({"": np.nan, "nan": np.nan, "None": np.nan}).infer_objects(copy=False)
+    gene = gene.fillna(pd.Series([f"UNKNOWN_{i+1}" for i in range(n)], index=df_raw.index)).astype(str)
 
     if col_spec is not None:
         spec_row = pd.to_numeric(df_raw[col_spec], errors="coerce").fillna(1.0)
