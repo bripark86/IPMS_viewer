@@ -293,7 +293,7 @@ def load_portal_data(
 
     for meta in metas:
         try:
-            df_gene = process_csv(meta.path, meta.mtime)
+            df_gene = load_and_aggregate_csv(meta.path)
             lda_csv_ok = bool(df_gene.attrs.get("ipms_lda_probability_column_in_csv", True))
             df_gene = add_baf_core_indicator(df_gene, BAF_SUBUNITS)
             enriched = enrich_meta_dict(meta)
@@ -326,9 +326,58 @@ def load_portal_data(
                 }
             )
         except Exception as e:
-            skipped_files.append(meta.file_key)
             parsing_errors.append({"file": meta.file_key, "reason": str(e) or "Unknown parse error"})
-            continue
+            try:
+                enriched = enrich_meta_dict(meta)
+            except Exception:
+                enriched = {
+                    "investigator": meta.investigator or "Unknown",
+                    "session_id": meta.session_id or "Unknown",
+                    "initials": meta.initials or "Unknown",
+                    "label": meta.label or "Unknown",
+                    "cell_line": "Unknown",
+                    "bait": "Unknown",
+                    "biological_target": "Unknown",
+                    "domain_details": "Unknown",
+                    "path": meta.path,
+                    "filename": meta.filename,
+                }
+            df_gene = pd.DataFrame(
+                {
+                    "Gene Symbol": [str(meta.filename).replace(".csv", "") or "UNKNOWN"],
+                    "Spectral Count": [1.0],
+                    "Unique Peptides": [1],
+                    "Confidence Score": [0.5],
+                    "Log_Prob": [-np.log10(0.5)],
+                }
+            )
+            df_gene = add_baf_core_indicator(df_gene, BAF_SUBUNITS)
+            df_gene = add_experiment_biological_columns(
+                df_gene,
+                biological_target=str(enriched.get("biological_target", "Unknown")),
+                domain_details=str(enriched.get("domain_details", "Unknown")),
+            )
+            df_gene.attrs["ipms_lda_probability_column_in_csv"] = False
+            aggregated_by_file[meta.file_key] = df_gene
+            meta_by_file[meta.file_key] = {**dict(enriched), "lda_probability_column_in_csv": False}
+            experiments_rows.append(
+                {
+                    "file_key": meta.file_key,
+                    "filename": meta.filename,
+                    "investigator": enriched.get("investigator") or "Unknown",
+                    "session_id": enriched.get("session_id") or "Unknown",
+                    "initials": enriched.get("initials") or "Unknown",
+                    "label": enriched.get("label") or "Unknown",
+                    "cell_line": enriched.get("cell_line") or "Unknown",
+                    "bait": enriched.get("bait") or "Unknown",
+                    "biological_target": enriched.get("biological_target") or "Unknown",
+                    "domain_details": enriched.get("domain_details") or "Unknown",
+                    "mtime": meta.mtime,
+                    "path": enriched.get("path") or meta.path,
+                    "n_proteins": int(df_gene["Gene Symbol"].nunique()),
+                    "n_baf_core": int(df_gene["is_baf_core"].sum()),
+                }
+            )
 
     experiments_df = pd.DataFrame(experiments_rows)
     if not experiments_df.empty and "mtime" in experiments_df.columns:
@@ -1804,6 +1853,10 @@ def _render_data_vault_tab(
 
 def main() -> None:
     st.set_page_config(page_title="BAF-Complex IP-MS Analytics Portal", layout="wide")
+    # One-time hard cache reset to forget stale skip state.
+    if not st.session_state.get("_forced_cache_reset_once", False):
+        st.cache_data.clear()
+        st.session_state["_forced_cache_reset_once"] = True
     # Inject CSS at app startup so it applies globally.
     _apply_global_css()
 
@@ -1820,7 +1873,6 @@ def main() -> None:
         st.markdown("### Data Directory & File Management")
 
         if st.button("Refresh Data"):
-            process_csv.clear()
             load_portal_data.clear()
             st.rerun()
 
@@ -1847,17 +1899,13 @@ def main() -> None:
             st.warning("No CSV datasets were parsed successfully. Please check CSV format/headers.")
             st.stop()
 
-        if skipped_files:
-            st.caption(f"Skipped {len(skipped_files)} file(s) due to parsing issues.")
+        if parsing_errors:
+            st.caption(f"Loaded with fallback parsing for {len(parsing_errors)} file(s).")
             with st.expander("View Parsing Errors"):
-                if parsing_errors:
-                    for pe in parsing_errors[:10]:
-                        st.write(f"- `{pe.get('file','unknown')}`: {pe.get('reason','Unknown error')}")
-                    if len(parsing_errors) > 10:
-                        st.caption(f"... and {len(parsing_errors) - 10} more")
-                else:
-                    for fk in skipped_files[:10]:
-                        st.write(f"- `{fk}`: Unknown parsing issue")
+                for pe in parsing_errors[:10]:
+                    st.write(f"- `{pe.get('file','unknown')}`: {pe.get('reason','Unknown error')}")
+                if len(parsing_errors) > 10:
+                    st.caption(f"... and {len(parsing_errors) - 10} more")
 
         dataset_keys_all = experiments_df["file_key"].astype(str).tolist()
         meta_lookup = meta_by_file
